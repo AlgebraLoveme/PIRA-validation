@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+"""Stage or publish manual native CI snapshots, with explicit public-source proof."""
+from __future__ import annotations
+
+import argparse
+import base64
+from collections.abc import Callable
+from contextlib import ExitStack
+import hashlib
+import json
+import os
+import platform
+import stat
+import tarfile
+import zipfile
+from urllib.request import urlopen
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import subprocess
+import tempfile
+import sys
+
+TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team", "pira_write_check")
+PUBLIC_SOURCE = "AlgebraLoveme/PIRA"
+PUBLIC_SOURCE_ID = 1193634683
+PUBLIC_VALIDATION = "AlgebraLoveme/PIRA-validation"
+PUBLIC_VALIDATION_ID = 1448640591
+PRIVATE_ARCHIVE_ID = 1409367001
+WORKFLOW = ".github/workflows/private-pira-tests.yml"
+OPTIONAL_ORACLE = ("tools/dev/pira_write_check/check.py", "tools/dev/pira_write_check/lexicon.json")
+POLICIES = ("docs/main.md", "docs/coordinator.md", "docs/implementation.md", "docs/review.md",
+            "docs/assignment_contract.md", "docs/continue_task.md", "docs/edit_authority.md", "docs/fix_task.md",
+            "docs/handoff.md", "docs/help.md", "docs/help_commands.md", "docs/help_manual.md",
+            "docs/implementation_stage.md", "docs/implementation_task.md",
+            "docs/ordinary_worker.md", "docs/repair_stage.md", "docs/repair_task.md", "docs/review_stage.md",
+            "docs/writing_application.md", "backend_contract.json", "worker_profiles.json")
+BLOCKED = {"__pycache__", "target", "cache", "caches", "logs", "stores", "credentials", "node_modules", "debug", "generated", "profiles", "auth"}
+
+NATIVE_CODEX_VERSION = "0.161.0"
+NATIVE_CODEX_ASSETS = {
+    "linux": ("codex-x86_64-unknown-linux-musl.tar.gz",
+              "b1efb95097660d7f2e5a3887618a23f2ea1b0d548078bf92b0f7a5d229a0cef2",
+              "codex-x86_64-unknown-linux-musl"),
+    "win32": ("codex-x86_64-pc-windows-msvc.exe.zip",
+              "a7493348634867c905f7298211923c57eb01dfe45400207a423c5453b190b11a",
+              "codex-x86_64-pc-windows-msvc.exe"),
+}
+# Exact layout observed in the hash-pinned official Windows 0.161.0 ZIP.
+WINDOWS_CODEX_MEMBERS = (
+    'bin/',
+    'codex-code-mode-host.exe',
+    'codex-command-runner.exe',
+    'codex-package.json',
+    'codex-path/',
+    'codex-path/rg.exe',
+    'codex-resources/',
+    'codex-resources/codex-command-runner.exe',
+    'codex-resources/codex-windows-sandbox-setup.exe',
+    'codex-resources/voice/',
+    'codex-resources/voice/bin/',
+    'codex-resources/voice/bin/codex-voice-host.exe',
+    'codex-resources/voice/bin/gio-2.0-0.dll',
+    'codex-resources/voice/bin/glib-2.0-0.dll',
+    'codex-resources/voice/bin/gmodule-2.0-0.dll',
+    'codex-resources/voice/bin/gobject-2.0-0.dll',
+    'codex-resources/voice/bin/gstapp-1.0-0.dll',
+    'codex-resources/voice/bin/gstapp.dll',
+    'codex-resources/voice/bin/gstaudio-1.0-0.dll',
+    'codex-resources/voice/bin/gstaudioconvert.dll',
+    'codex-resources/voice/bin/gstaudioresample.dll',
+    'codex-resources/voice/bin/gstbase-1.0-0.dll',
+    'codex-resources/voice/bin/gstcoreelements.dll',
+    'codex-resources/voice/bin/gstnet-1.0-0.dll',
+    'codex-resources/voice/bin/gstopus.dll',
+    'codex-resources/voice/bin/gstpbutils-1.0-0.dll',
+    'codex-resources/voice/bin/gstreamer-1.0-0.dll',
+    'codex-resources/voice/bin/gstrtp-1.0-0.dll',
+    'codex-resources/voice/bin/gstrtp.dll',
+    'codex-resources/voice/bin/gstrtpmanager.dll',
+    'codex-resources/voice/bin/gsttag-1.0-0.dll',
+    'codex-resources/voice/bin/gstvideo-1.0-0.dll',
+    'codex-resources/voice/bin/intl-8.dll',
+    'codex-resources/voice/bin/libffi-8.dll',
+    'codex-resources/voice/bin/opus.dll',
+    'codex-resources/voice/bin/pcre2-8.dll',
+    'codex-resources/voice/bin/vcruntime140.dll',
+    'codex-resources/voice/bin/z.dll',
+    'codex-resources/voice/licenses/',
+    'codex-resources/voice/licenses/LGPL-2.1.txt',
+    'codex-resources/voice/licenses/libffi.txt',
+    'codex-resources/voice/licenses/Opus.txt',
+    'codex-resources/voice/licenses/PCRE2.md',
+    'codex-resources/voice/licenses/proxy-libintl.txt',
+    'codex-resources/voice/licenses/sljit.txt',
+    'codex-resources/voice/licenses/zlib.txt',
+    'codex-resources/voice/manifest.json',
+    'codex-resources/voice/NOTICE.md',
+    'codex-resources/voice/runtime.json',
+    'codex-resources/voice/sources.json',
+    'codex-resources/voice/windows-crt.json',
+    'codex-windows-sandbox-setup.exe',
+    'codex-x86_64-pc-windows-msvc.exe',
+)
+WINDOWS_CODEX_MANIFEST = {'layoutVersion': 1, 'version': '0.161.0', 'target': 'x86_64-pc-windows-msvc', 'variant': 'codex', 'entrypoint': 'codex-x86_64-pc-windows-msvc.exe', 'resourcesDir': 'codex-resources', 'pathDir': 'codex-path'}
+MAX_CODEX_BYTES = 512 * 1024 * 1024
+# Current protocol/setup checks are independent of the historical relocation fixture.
+TEAM_CODEX_VERSION = "0.166.0"
+TEAM_CODEX_ASSETS = {
+    "linux": ("codex-x86_64-unknown-linux-musl.tar.gz",
+              "a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978",
+              "codex-x86_64-unknown-linux-musl"),
+    "win32": ("codex-x86_64-pc-windows-msvc.exe.zip",
+              "bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d",
+              "codex-x86_64-pc-windows-msvc.exe"),
+}
+# Exact 54-entry official 0.166.0 ZIP: the historical layout plus exec-server.
+TEAM_WINDOWS_CODEX_MEMBERS = (
+    WINDOWS_CODEX_MEMBERS[0], 'bin/codex-exec-server.exe', *WINDOWS_CODEX_MEMBERS[1:],
+)
+TEAM_WINDOWS_CODEX_MANIFEST = {
+    **WINDOWS_CODEX_MANIFEST, 'version': TEAM_CODEX_VERSION,
+    'execServer': 'bin/codex-exec-server.exe',
+}
+MAX_TEAM_EXPANDED_CODEX_BYTES = 1024 * 1024 * 1024
+NATIVE_RELOCATION_INPUTS = (
+    "assets/scripts/team_store_relocation.py",
+    "assets/scripts/test_team_store_relocation.py",
+    "assets/scripts/team_relocation_fixture.py",
+)
+
+
+def extract_windows_codex(archive: Path, directory: Path, *, profile: str = "relocation") -> None:
+    """Retain the entire pinned relative layout, never extract archive-selected paths."""
+    if profile not in ("relocation", "team"):
+        raise ValueError(f"Unknown Codex CI profile: {profile}")
+    inventory = TEAM_WINDOWS_CODEX_MEMBERS if profile == "team" else WINDOWS_CODEX_MEMBERS
+    manifest = TEAM_WINDOWS_CODEX_MANIFEST if profile == "team" else WINDOWS_CODEX_MANIFEST
+    aggregate_limit = MAX_TEAM_EXPANDED_CODEX_BYTES if profile == "team" else MAX_CODEX_BYTES
+    if directory.is_symlink() or not directory.is_dir() or any(directory.iterdir()):
+        raise RuntimeError("Windows Codex extraction requires an empty plain directory")
+    with zipfile.ZipFile(archive) as package:
+        members = package.infolist()
+        if (len(members) != len(inventory)
+                or {item.filename for item in members} != set(inventory)):
+            raise RuntimeError("Unexpected Codex archive member inventory")
+        total = 0
+        for item in members:
+            directory_entry = item.filename.endswith('/')
+            allowed_modes = (0, stat.S_IFDIR) if directory_entry else (0, stat.S_IFREG)
+            if (stat.S_IFMT(item.external_attr >> 16) not in allowed_modes
+                    or bool(item.external_attr & 0x10) and not directory_entry
+                    or item.flag_bits & 1
+                    or (directory_entry and item.file_size != 0)
+                    or (not directory_entry and not 0 < item.file_size <= MAX_CODEX_BYTES)):
+                raise RuntimeError("Unsafe Codex archive member")
+            total += item.file_size
+        if total > aggregate_limit:
+            raise RuntimeError("Invalid expanded Codex size")
+        if package.getinfo('codex-package.json').file_size > 4096:
+            raise RuntimeError("Invalid Codex package manifest size")
+        if json.loads(package.read('codex-package.json')) != manifest:
+            raise RuntimeError("Unexpected Codex package manifest")
+        # All names have matched literal reviewed constants, including directories.
+        for name in inventory:
+            target = directory / name
+            if name.endswith('/'):
+                target.mkdir()
+                continue
+            item = package.getinfo(name)
+            received = 0
+            with package.open(item) as source, target.open('xb') as output:
+                while chunk := source.read(64 * 1024):
+                    received += len(chunk)
+                    if received > item.file_size:
+                        raise RuntimeError("Expanded Codex exceeds declared size")
+                    output.write(chunk)
+            if received != item.file_size:
+                raise RuntimeError("Truncated Codex member")
+
+
+def extract_codex(archive: Path, member_name: str, destination: Path, *, profile: str = "relocation") -> None:
+    """Extract the pinned platform layout without trusting archive paths or modes."""
+    try:
+        with ExitStack() as stack:
+            if archive.name.endswith(".zip"):
+                if member_name != WINDOWS_CODEX_MANIFEST['entrypoint'] or destination.name != member_name:
+                    raise RuntimeError("Unexpected Windows Codex entrypoint")
+                extract_windows_codex(archive, destination.parent, profile=profile)
+                return
+            else:
+                package = stack.enter_context(tarfile.open(archive, "r:gz"))
+                member = package.next()
+                if member is None or member.name != member_name or not member.isfile():
+                    raise RuntimeError("Unexpected Codex archive member")
+                size = member.size
+                if not 0 < size <= MAX_CODEX_BYTES:
+                    raise RuntimeError("Invalid expanded Codex size")
+                source = stack.enter_context(package.extractfile(member))
+            received = 0
+            with destination.open("xb") as output:
+                while chunk := source.read(64 * 1024):
+                    received += len(chunk)
+                    if received > size:
+                        raise RuntimeError("Expanded Codex exceeds declared size")
+                    output.write(chunk)
+            if received != size:
+                raise RuntimeError("Truncated Codex member")
+            if not archive.name.endswith(".zip") and package.next() is not None:
+                raise RuntimeError("Expected exactly one Codex archive member")
+    except (tarfile.TarError, zipfile.BadZipFile) as error:
+        raise RuntimeError(f"Invalid Codex archive: {error}") from error
+
+
+def provision_codex(directory: Path, *, profile: str = "relocation") -> Path:
+    """Provision a pinned CI package; default remains the historical relocation target."""
+    if profile not in ("relocation", "team"):
+        raise ValueError(f"Unknown Codex CI profile: {profile}")
+    version = TEAM_CODEX_VERSION if profile == "team" else NATIVE_CODEX_VERSION
+    assets = TEAM_CODEX_ASSETS if profile == "team" else NATIVE_CODEX_ASSETS
+    if sys.platform not in assets or platform.machine().lower() not in ("amd64", "x86_64"):
+        raise RuntimeError("Native relocation CI requires x64 Linux or Windows")
+    if directory.exists() or directory.is_symlink():
+        raise RuntimeError(f"Refusing to overwrite Codex destination: {directory}")
+    asset, expected, member = assets[sys.platform]
+    url = f"https://github.com/openai/codex/releases/download/rust-v{version}/{asset}"
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".pira-native-codex-", dir=directory.parent) as temporary:
+        root = Path(temporary)
+        archive = root / asset
+        checksum = hashlib.sha256()
+        received = 0
+        with urlopen(url, timeout=60) as response, archive.open("xb") as output:
+            while chunk := response.read(64 * 1024):
+                received += len(chunk)
+                if received > MAX_CODEX_BYTES:
+                    raise RuntimeError("Codex archive exceeds safety limit")
+                checksum.update(chunk)
+                output.write(chunk)
+        if checksum.hexdigest() != expected:
+            raise RuntimeError("Pinned Codex SHA-256 mismatch")
+        package = root / "bin"
+        package.mkdir()
+        binary = package / (member if sys.platform == "win32" else "codex")
+        extract_codex(archive, member, binary, profile=profile)
+        binary.chmod(0o755)
+        home = root / "home"
+        home.mkdir()
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}}
+        env.update(HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(home),
+                   CODEX_HOME=str(home), TMP=str(root), TEMP=str(root), TMPDIR=str(root))
+        try:
+            result = subprocess.run([str(binary), "--version"], env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("Pinned Codex version check timed out") from error
+        if result.returncode or result.stdout.strip() != f"codex-cli {version}":
+            raise RuntimeError("Pinned Codex binary version check failed")
+        if directory.exists() or directory.is_symlink():
+            raise RuntimeError(f"Codex destination appeared during provisioning: {directory}")
+        package.rename(directory)
+    return directory / binary.name
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def selected(root: Path) -> list[Path]:
+    # Runtime policy-mirror inputs used by Team Python tests (not user profiles).
+    paths = [Path("AGENTS.md"), Path("modules/CODING_STYLE.md"),
+             Path("modules/PUBLIC_FIGURE_STYLE.md"), Path("modules/SCIENTIFIC_WRITING.md"),
+             Path("tools/Cargo.toml"), Path("tools/Cargo.lock")]
+    for tool in TOOLS:
+        paths.append(Path(f"tools/crates/{tool}/Cargo.toml"))
+        for directory, extensions in ((f"tools/src/{tool}", {".rs"}),
+                                       (f"tools/crates/{tool}/tests", {".rs", ".py", ".svg"})):
+            base = root / directory
+            if not base.is_dir() or base.is_symlink():
+                raise RuntimeError(f"missing or linked allowed directory: {directory}")
+            for parent, dirs, files in os.walk(base, followlinks=False):
+                dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.lower() not in BLOCKED
+                                 and "benchmark" not in d.lower())
+                for name in dirs + files:
+                    if (Path(parent) / name).is_symlink():
+                        raise RuntimeError(f"symlink in allowed tree: {directory}/{name}")
+                for name in sorted(files):
+                    if (name.startswith(".") or name == "live_smoke.py" or "benchmark" in name.lower()
+                            or Path(name).suffix not in extensions):
+                        continue
+                    paths.append((Path(parent) / name).relative_to(root))
+    paths.extend(Path("tools/src/pira_team") / name for name in POLICIES)
+    paths.append(Path("tools/src/pira_team/tier_fixture.py"))
+    paths.append(Path("tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf"))
+    paths.extend(Path(name) for name in (
+        "assets/scripts/setup_pira.py", "assets/scripts/test_setup_pira.py",
+        "assets/scripts/retire_pira_audio.py", "assets/scripts/test_retire_pira_audio.py",
+        "assets/scripts/setup_pira_tools.py", "assets/scripts/test_setup_pira_tools.py",
+        "assets/scripts/setup_pira_claude.py", "assets/scripts/setup_pira_claude_runtime.py",
+        "assets/scripts/test_setup_pira_claude.py",
+        "assets/scripts/test_python_bootstrap.py",
+        "assets/scripts/setup_pira.sh", "assets/scripts/setup_pira.ps1",
+        "assets/scripts/lib/pira_python_bootstrap.sh", "assets/scripts/lib/pira_python_bootstrap.ps1",
+        "assets/scripts/setup_pira_stores.py", "assets/scripts/test_setup_pira_stores.py",
+        "assets/scripts/setup_pira_communication.py", "assets/scripts/test_setup_pira_communication.py",
+        "assets/COMMUNICATION_AGENTS_TEMPLATE.md", "assets/COMMUNICATION_WORKBOOK_TEMPLATE.md",
+        "assets/scripts/setup_migration_choices.py", "assets/scripts/test_setup_migration_choices.py",
+        "assets/scripts/migrate_pira_stores.py", "assets/scripts/test_migrate_pira_stores.py",
+        "assets/LEGACY_LIST.md", "tools/select_tool_for_platform.py"))
+    paths.extend(Path(name) for name in (
+        "tools/src/pira_write_check/help.md",
+        "tools/src/pira_write_check/lexicon.json",
+        "tools/crates/pira_write_check/tests/evaluation.json",
+        "tools/dev/pira_write_check/benchmark.py",
+        "tools/dev/pira_write_check/test_benchmark.py",
+    ))
+    # Optional retained development oracle; Rust lexical fixtures are self-contained.
+    for name in OPTIONAL_ORACLE:
+        path = root / name
+        if path.exists() or path.is_symlink():
+            paths.append(Path(name))
+    paths.append(Path("tools/build/private_ci.py"))
+    paths.extend(Path(name) for name in NATIVE_RELOCATION_INPUTS)
+    return sorted(set(paths))
+
+def stage(root: Path, test_tools: tuple[str, ...] = TOOLS,
+          select: Callable[[Path], list[Path]] | None = None) -> dict:
+    """Copy allowlisted working-tree bytes to a fresh temporary snapshot."""
+    root = root.resolve()
+    select = select if select is not None else selected
+    release = root / ".github/workflows/build-pira-tool-bundles.yml"
+    pins = set(re.findall(r"actions/checkout@([0-9a-f]{40})", release.read_text()))
+    if len(pins) != 1:
+        raise ValueError("expected one pinned checkout revision in release workflow")
+    workflow = Path(__file__).with_name("private_ci_workflow.yml").read_text().replace(
+        "@CHECKOUT@", pins.pop()).replace(
+        "@DESTINATION_GUARD@", "github.event.repository.private == true")
+
+    def dirty() -> bytes:
+        return git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+
+    def head() -> str:
+        return git(root, "rev-parse", "HEAD").stdout.decode().strip()
+
+    if not test_tools or any(tool not in TOOLS for tool in test_tools):
+        raise ValueError("select at least one known test tool")
+    original_head = head()
+    original_status = dirty()
+    paths = select(root)
+    data = {}
+    for path in paths:
+        if any(part.is_symlink() for part in (root / path, *(root / path).parents)):
+            raise RuntimeError(f"linked source: {path}")
+        data[path.as_posix()] = (root / path).read_bytes()
+    # Literal include dependencies must remain within the selected snapshot.
+    for name, content in data.items():
+        if not name.endswith(".rs"):
+            continue
+        for dependency in re.findall(r'include(?:_str|_bytes)?!\s*\(\s*"([^"]+)"', content.decode()):
+            target = (root / name).parent / dependency
+            relative = target.resolve().relative_to(root).as_posix()
+            if relative not in data:
+                raise RuntimeError(f"unselected include dependency: {name}: {dependency}")
+    # Catch concurrent changes, including newly added/removed eligible files.
+    if paths != select(root) or original_head != head() or original_status != dirty() or any(
+            (root / name).read_bytes() != content for name, content in data.items()):
+        raise RuntimeError("source changed during staging; rerun after workers finish")
+    counts = {tool: sum(f"/{tool}/" in name for name in data) for tool in TOOLS}
+    provenance = {"original_head": original_head, "source": "current working tree, including uncommitted changes",
+                  "original_dirty": bool(original_status), "original_status_sha256": digest(original_status),
+                  "source_file_count": len(data), "per_tool_file_counts": counts, "tested_tools": list(test_tools)}
+    data["SNAPSHOT_PROVENANCE.json"] = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
+    extra_tests = ""
+    for tool in ("pira_write_check", "pira_team"):
+        if tool in test_tools:
+            extra_tests = (extra_tests + "\n" if extra_tests else "        include:\n") + (
+                f"          - os: macos-latest\n            crate: {tool}")
+    data[".github/workflows/private-pira-tests.yml"] = workflow.replace(
+        "@TEST_TOOLS@", json.dumps(list(test_tools))).replace("@TEST_EXTRA@", extra_tests).encode()
+    data[".gitattributes"] = b"* -text\n"
+    manifest = "".join(f"{digest(content)}  {name}\n" for name, content in sorted(data.items()))
+    data["SOURCE_SHA256SUMS"] = manifest.encode()
+    destination = Path(tempfile.mkdtemp(prefix="pira-private-ci-"))
+    for name, content in data.items():
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    verify(destination)
+    return {"stage": str(destination), **provenance, "total_files": len(data)}
+
+
+def github_json(path: str) -> dict:
+    result = subprocess.run(['gh', 'api', '--hostname', 'github.com', path],
+                            check=True, stdout=subprocess.PIPE, text=True)
+    return json.loads(result.stdout)
+
+
+def git_blob(content: bytes) -> str:
+    return hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest()
+
+
+def public_source() -> dict:
+    """Authenticate the current public master tree, never a local/private commit."""
+    info = github_json(f'repos/{PUBLIC_SOURCE}')
+    if (info.get('id') != PUBLIC_SOURCE_ID or info.get('private') is not False
+            or info.get('visibility') != 'public' or info.get('full_name') != PUBLIC_SOURCE):
+        raise ValueError('public PIRA source identity/visibility mismatch')
+    ref = github_json(f'repos/{PUBLIC_SOURCE}/git/ref/heads/master')
+    sha = ref.get('object', {}).get('sha', '')
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise ValueError('invalid public master SHA')
+    tree = github_json(f'repos/{PUBLIC_SOURCE}/git/trees/{sha}?recursive=1')
+    if tree.get('truncated') is not False or not isinstance(tree.get('tree'), list):
+        raise ValueError('incomplete public source tree')
+    blobs = {item['path']: item['sha'] for item in tree['tree']
+             if item.get('type') == 'blob' and item.get('mode') in ('100644', '100755')}
+    template_sha = blobs['tools/build/private_ci_workflow.yml']
+    blob = github_json(f'repos/{PUBLIC_SOURCE}/git/blobs/{template_sha}')
+    if blob.get('encoding') != 'base64':
+        raise ValueError('invalid public workflow encoding')
+    template = base64.b64decode(blob['content'])
+    if git_blob(template) != template_sha:
+        raise ValueError('public workflow blob mismatch')
+    if not re.search(rb'^on:\n  workflow_dispatch:\npermissions:', template, re.MULTILINE):
+        raise ValueError('published validation template must be manual-only')
+    return {'sha': sha, 'blobs': blobs, 'template': template}
+
+
+def public_workflow(template: bytes, tools: list[str], checkout: str) -> bytes:
+    extra = ''
+    for tool in ('pira_write_check', 'pira_team'):
+        if tool in tools:
+            extra += ('\n' if extra else '        include:\n') + (
+                f'          - os: macos-latest\n            crate: {tool}')
+    guard = (f"github.repository == '{PUBLIC_VALIDATION}' && "
+             f"github.event.repository.id == {PUBLIC_VALIDATION_ID} && "
+             "github.event.repository.private == false")
+    return (template.decode().replace('@CHECKOUT@', checkout)
+            .replace('@TEST_TOOLS@', json.dumps(tools)).replace('@TEST_EXTRA@', extra)
+            .replace('@DESTINATION_GUARD@', guard)).encode()
+
+
+def public_provenance(sha: str, tools: list[str]) -> bytes:
+    return (json.dumps({'source_repository': PUBLIC_SOURCE, 'source_sha': sha,
+                        'tested_tools': tools}, indent=2, sort_keys=True) + '\n').encode()
+
+
+def verify_public(stage: Path, source: dict | None = None) -> dict[str, bytes]:
+    """Require every payload byte to be already public and workflow to be canonical."""
+    data = verify(stage)
+    source = source if source is not None else public_source()
+    provenance = json.loads(data['SNAPSHOT_PROVENANCE.json'])
+    if not isinstance(provenance, dict):
+        raise ValueError('expected public provenance object')
+    tools = provenance.get('tested_tools')
+    if (not isinstance(tools, list) or not tools or any(t not in TOOLS for t in tools)
+            or len(set(tools)) != len(tools)
+            or data['SNAPSHOT_PROVENANCE.json'] != public_provenance(source['sha'], tools)):
+        raise ValueError('public provenance must identify current public master and selected tools only')
+    payload = {path.as_posix() for path in selected(stage)}
+    generated = {WORKFLOW, 'SNAPSHOT_PROVENANCE.json', '.gitattributes', 'SOURCE_SHA256SUMS'}
+    if set(data) != payload | generated or data['.gitattributes'] != b'* -text\n':
+        raise ValueError('unexpected public snapshot inventory')
+    for name in payload:
+        if source['blobs'].get(name) != git_blob(data[name]):
+            raise ValueError(f'payload is not the published PIRA source: {name}')
+    # The checkout pin is itself from the authenticated public release workflow.
+    release = github_json(f"repos/{PUBLIC_SOURCE}/contents/.github/workflows/build-pira-tool-bundles.yml?ref={source['sha']}")
+    release_bytes = base64.b64decode(release['content'])
+    if git_blob(release_bytes) != source['blobs'].get('.github/workflows/build-pira-tool-bundles.yml'):
+        raise ValueError('public release workflow blob mismatch')
+    pins = set(re.findall(rb'actions/checkout@([0-9a-f]{40})', release_bytes))
+    if len(pins) != 1 or data[WORKFLOW] != public_workflow(source['template'], tools, pins.pop().decode()):
+        raise ValueError('public workflow differs from the manual-only public template')
+    return data
+
+
+def stage_public(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
+    """Stage only clean tracked source at the current public PIRA master commit."""
+    root = root.resolve()
+    if git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all').stdout:
+        raise ValueError('public staging requires a clean committed checkout; no dirty/untracked inputs')
+    source = public_source()
+    if git(root, 'rev-parse', 'HEAD').stdout.decode().strip() != source['sha']:
+        raise ValueError('public staging requires current published PIRA master')
+    tracked = set(git(root, 'ls-files', '-z').stdout.decode().split('\0'))
+    if not {p.as_posix() for p in public_selected(root)} <= tracked:
+        raise ValueError('public staging rejects ignored or untracked payload files')
+    result = stage(root, test_tools, public_selected)
+    destination = Path(result['stage'])
+    data = verify(destination)
+    data.pop('SOURCE_SHA256SUMS')
+    tools = list(test_tools)
+    pins = set(re.findall(r'actions/checkout@([0-9a-f]{40})',
+                         (root / '.github/workflows/build-pira-tool-bundles.yml').read_text()))
+    data[WORKFLOW] = public_workflow(source['template'], tools, pins.pop())
+    data['SNAPSHOT_PROVENANCE.json'] = public_provenance(source['sha'], tools)
+    for name in (WORKFLOW, 'SNAPSHOT_PROVENANCE.json'):
+        (destination / name).write_bytes(data[name])
+    (destination / 'SOURCE_SHA256SUMS').write_text(
+        ''.join(f'{digest(content)}  {name}\n' for name, content in sorted(data.items())))
+    verify_public(destination, source)
+    return {'stage': str(destination), 'source_sha': source['sha'], 'tested_tools': tools}
+
+
+def public_selected(root: Path) -> list[Path]:
+    """Do not read/upload the optional retained oracle unless it is tracked."""
+    tracked = set(git(root, 'ls-files', '-z').stdout.decode().split('\0'))
+    return [path for path in selected(root)
+            if path.as_posix() not in OPTIONAL_ORACLE or path.as_posix() in tracked]
+
+
+def git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run Git without inherited repository/index overrides or hooks."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    env['GIT_OPTIONAL_LOCKS'] = '0'
+    return subprocess.run(['git', '-c', f'core.hooksPath={os.devnull}',
+                           '-c', 'core.autocrlf=false', '-c', f'core.attributesFile={os.devnull}', *args], cwd=root,
+                          env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def verify(stage: Path) -> dict[str, bytes]:
+    """Validate exact inventory and hashes; return immutable verified file bytes."""
+    if stage.is_symlink() or not stage.is_dir():
+        raise ValueError('expected an unlinked stage directory')
+    inventory = set()
+    for parent, dirs, files in os.walk(stage, followlinks=False):
+        for name in dirs + files:
+            path = Path(parent) / name
+            if path.is_symlink() or name.lower() == '.git':
+                raise ValueError(f'linked path or Git metadata in stage: {path}')
+        for name in files:
+            path = Path(parent) / name
+            if not path.is_file():
+                raise ValueError(f'not a regular file: {path}')
+            inventory.add(path.relative_to(stage).as_posix())
+    manifest = (stage / 'SOURCE_SHA256SUMS').read_bytes()
+    data = {}
+    folded = set()
+    for line in manifest.decode('utf-8').splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64})  (.+)', line)
+        if not match:
+            raise ValueError('invalid manifest record')
+        expected, name = match.groups()
+        parts = PurePosixPath(name).parts
+        if (not parts or PurePosixPath(name).is_absolute() or
+                PurePosixPath(name).as_posix() != name or
+                any(p in ('.', '..') or p.lower() == '.git' for p in parts) or
+                any(c in name for c in '\\:\r\n\t') or
+                name == 'SOURCE_SHA256SUMS' or name.casefold() in folded):
+            raise ValueError(f'unsafe or duplicate manifest path: {name}')
+        folded.add(name.casefold())
+        if name not in inventory:
+            raise ValueError(f'missing manifest file: {name}')
+        content = (stage / name).read_bytes()
+        if digest(content) != expected:
+            raise ValueError(f'snapshot hash mismatch: {name}')
+        data[name] = content
+    required = {'SNAPSHOT_PROVENANCE.json', '.gitattributes',
+                '.github/workflows/private-pira-tests.yml'}
+    if not required <= data.keys() or inventory != data.keys() | {'SOURCE_SHA256SUMS'}:
+        raise ValueError('missing required snapshot metadata or extraneous files')
+    data['SOURCE_SHA256SUMS'] = manifest
+    return data
+
+def require_private(repo: str) -> None:
+    """Fail closed on destination visibility, including API/authentication errors."""
+    result = subprocess.run(['gh', 'api', '--hostname', 'github.com', f'repos/{repo}'],
+                            check=True, stdout=subprocess.PIPE, text=True)
+    info = json.loads(result.stdout)
+    if info.get('private') is not True or info.get('full_name', '').lower() != repo.lower():
+        raise ValueError('refusing non-private or mismatched destination')
+    if info.get('id') == PRIVATE_ARCHIVE_ID:
+        raise ValueError('historical validation archive is evidence-only; never publish new snapshots there')
+
+
+def require_public_target(repo: str) -> dict:
+    if repo != PUBLIC_VALIDATION:
+        raise ValueError('public publication is restricted to the dedicated PIRA-validation repository')
+    info = github_json(f'repos/{repo}')
+    if (info.get('id') != PUBLIC_VALIDATION_ID or info.get('private') is not False
+            or info.get('visibility') != 'public' or info.get('full_name') != repo
+            or info.get('archived') is not False):
+        raise ValueError('public validation destination identity/visibility mismatch')
+    return info
+
+def publish(stage: Path, repo: str, branch: str) -> dict:
+    """Publish to a private compatibility destination; never the historical archive."""
+    return publish_bytes(verify(stage), repo, branch, stage, lambda: require_private(repo))
+
+
+def publish_public(stage: Path, repo: str, branch: str) -> dict:
+    """Publish authenticated public source without dispatching or replacing a branch."""
+    def destination():
+        info = require_public_target(repo)
+        if branch == info.get('default_branch'):
+            raise ValueError('snapshot publication cannot replace the default seed branch')
+    destination()
+    return publish_bytes(verify_public(stage), repo, branch, stage, destination)
+
+
+def publish_bytes(data: dict[str, bytes], repo: str, branch: str, stage: Path,
+                  destination: Callable[[], object]) -> dict:
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', repo):
+        raise ValueError('expected explicit OWNER/REPO on github.com')
+    if branch.startswith('-') or branch == 'HEAD':
+        raise ValueError('expected a new branch name')
+    destination()
+    remote = f'https://github.com/{repo}.git'
+    ref = f'refs/heads/{branch}'
+    # PIRA: publication is GitHub-only; supporting other hosts requires explicit visibility APIs.
+    with tempfile.TemporaryDirectory(prefix='pira-private-publish-') as tmp:
+        work = Path(tmp)
+        git(work, 'check-ref-format', ref)
+        git(work, 'init', '--template=', '-b', branch)
+        if git(work, 'ls-remote', '--heads', remote, ref).stdout.strip():
+            raise ValueError('destination branch already exists; choose a new branch (never overwrite)')
+        for name, content in data.items():
+            path = work / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        git(work, 'add', '--force', '--', '.')
+        git(work, '-c', 'user.name=PIRA CI snapshot', '-c',
+            'user.email=private-ci@users.noreply.github.com', '-c', 'commit.gpgSign=false',
+            'commit', '-m', 'Prepare manual native-platform validation snapshot')
+        commit = git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+        destination()
+        try:
+            # Empty lease requires nonexistence even if another publisher won the race.
+            git(work, 'push', f'--force-with-lease={ref}:', remote, f'HEAD:{ref}')
+        except subprocess.CalledProcessError as error:
+            inspect_command = shlex.join(['git', 'ls-remote', '--heads', remote, ref])
+            raise RuntimeError(
+                f'Publish failed or outcome is uncertain; stage is unchanged: {stage}. '
+                f'Expected commit {commit}. Inspect `{inspect_command}` '
+                'and GitHub Actions. If that commit exists, do not republish; dispatch is separate. If absent, '
+                'retry the same command; if a different commit exists, choose a new branch. '
+                f'Never delete/force an existing branch. Git: {(error.stderr or b"").decode(errors="replace")}') from error
+    return {'repo': repo, 'branch': branch, 'commit': commit}
+
+def native_relocation(directory: Path, binary: Path, root: Path) -> None:
+    """Run the owner's required fixture; retain synthetic evidence, never skip."""
+    directory = directory.resolve()
+    binary = binary.resolve(strict=True)
+    root = root.resolve(strict=True)
+    directory.mkdir()  # Require a fresh task-local destination, never reuse a home.
+    home = directory / 'home'
+    home.mkdir()
+    environment = {key: value for key, value in os.environ.items()
+                   if key.upper() in {'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT'}}
+    environment.update(HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(home),
+                       CODEX_HOME=str(home / 'codex'), TMP=str(home), TEMP=str(home),
+                       TMPDIR=str(home), PYTHONDONTWRITEBYTECODE='1',
+                       PIRA_RELOCATION_TEST_SCRATCH=str(directory))
+    test = root / 'assets/scripts/test_team_store_relocation.py'
+    commands = [
+        ('deterministic', [sys.executable, '-B', str(test), '-v']),
+        ('completed-turns', [sys.executable, '-B', str(test), '--native', '--completed-turns',
+                             '--scratch', str(directory), '--binary', str(binary)]),
+    ]
+    failures = []
+    try:
+        for label, command in commands:
+            log = directory / (label + '.log')
+            with log.open('wb') as output:
+                try:
+                    result = subprocess.run(command, cwd=root, env=environment,
+                                            stdin=subprocess.DEVNULL, stdout=output,
+                                            stderr=subprocess.STDOUT, timeout=480)
+                    if result.returncode:
+                        failures.append(f'{label}: exit {result.returncode}')
+                except subprocess.TimeoutExpired:
+                    failures.append(f'{label}: timed out')
+            print(f'{label}: evidence {log}', flush=True)
+    finally:
+        # Only synthetic diagnostics, not homes, auth, rollout databases or records.
+        # Prefix/JSON-escape lines so subprocess text cannot become Actions commands.
+        names = {'deterministic.log', 'completed-turns.log', 'result.json',
+                 'repair.json', 'failure.json', 'native.stderr'}
+        for parent, dirs, files in os.walk(directory, followlinks=False):
+            dirs[:] = sorted(name for name in dirs if not (Path(parent) / name).is_symlink())
+            for name in sorted(set(files) & names):
+                path = Path(parent) / name
+                if path.is_symlink() or not path.is_file():
+                    continue
+                print('Evidence: ' + str(path.relative_to(directory)), flush=True)
+                with path.open(encoding='utf-8', errors='replace') as stream:
+                    for line in stream:
+                        print('fixture: ' + json.dumps(line.rstrip('\n')), flush=True)
+        print('Retained disposable evidence: ' + str(directory), flush=True)
+    if failures:
+        raise RuntimeError('Required native relocation validation failed: ' + '; '.join(failures))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    staging = commands.add_parser('stage', help='create fresh local snapshot; no network')
+    staging.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
+    staging.add_argument('--test-tool', choices=TOOLS, action='append',
+                         help='repeat for a CI subset; all workspace sources are still staged')
+    public_staging = commands.add_parser('stage-public', help='stage clean current public PIRA master only')
+    public_staging.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
+    public_staging.add_argument('--test-tool', choices=TOOLS, action='append')
+    checking = commands.add_parser('verify', help='check exact inventory and hashes; no network')
+    checking.add_argument('--stage', type=Path, required=True)
+    publishing = commands.add_parser('publish', help='create a new branch in an explicit private repo')
+    publishing.add_argument('--stage', type=Path, required=True)
+    publishing.add_argument('--repo', required=True)
+    publishing.add_argument('--branch', required=True)
+    public_publishing = commands.add_parser('publish-public', help='publish a new manual-only snapshot; no dispatch')
+    public_publishing.add_argument('--stage', type=Path, required=True)
+    public_publishing.add_argument('--repo', required=True)
+    public_publishing.add_argument('--branch', required=True)
+    provisioning = commands.add_parser('provision-codex', help='download hash-pinned CI Codex into a new task-local directory')
+    provisioning.add_argument('--directory', type=Path, required=True)
+    native = commands.add_parser('native-relocation', help='run required isolated completed-turn fixture')
+    native.add_argument('--directory', type=Path, required=True)
+    native.add_argument('--binary', type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == 'stage':
+            result = stage(args.root, tuple(dict.fromkeys(args.test_tool or TOOLS)))
+        elif args.command == 'stage-public':
+            result = stage_public(args.root, tuple(dict.fromkeys(args.test_tool or TOOLS)))
+        elif args.command == 'publish-public':
+            result = publish_public(args.stage, args.repo, args.branch)
+        elif args.command == 'provision-codex':
+            result = {'codex': str(provision_codex(args.directory))}
+        elif args.command == 'native-relocation':
+            native_relocation(args.directory, args.binary, Path(__file__).resolve().parents[2])
+            result = {'status': 'verified_fixture_only', 'evidence': str(args.directory.resolve())}
+        elif args.command == 'verify':
+            result = {'verified_files': len(verify(args.stage))}
+        else:
+            result = publish(args.stage, args.repo, args.branch)
+        print(json.dumps(result, indent=2, sort_keys=True))
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'private_ci: {error}', file=sys.stderr)
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(error.stderr.decode(errors='replace'), file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

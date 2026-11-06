@@ -1,0 +1,281 @@
+# Manual native CI snapshots
+
+Cloud standard-hosted validation is the normal route: native Linux and Windows,
+plus the existing macOS Team/writing-checker checks. Use focused selected-tool
+snapshots while iterating; retain full required platform/x86-64 and reproducibility
+coverage for final release acceptance. This is not a local-first or Windows-only
+policy. The historical filename `private_ci.py` remains for compatibility.
+
+Requires Python 3.11+, Git, authenticated `gh` and Git HTTPS access. The supported
+public destination is **AlgebraLoveme/PIRA-validation**, numeric ID **1448640591**.
+The old private repository, ID **1409367001**, is now
+**AlgebraLoveme/PIRA-validation-archive**. It remains private evidence; the helper
+refuses new publication to that identity. Never mirror its commits, snapshots or
+logs into the public repository. A name redirect is not an evidence identity.
+
+## Offline checks
+
+```bash
+python3 -B -m unittest discover -s tools/build -p test_private_ci.py -v
+```
+
+Tests use synthetic source, mocked APIs and temporary local bare Git remotes; they
+do not dispatch workflows, compile production tools, install packages or use models.
+
+## Public snapshots: current published source only
+
+Finish source edits and commit/push the intended public PIRA changes first, under
+normal review and CI holds. Then use the clean canonical PIRA checkout:
+
+```bash
+python3 -B tools/build/private_ci.py stage-public --test-tool pira_ctx --test-tool pira_team
+# Omit --test-tool only when all six tools actually need this validation.
+```
+
+The helper requires a clean tracked checkout at the current public PIRA `master`.
+Dirty/untracked files, ignored required allowlisted files and unpublished commits fail;
+there is no implicit upload of a working tree. Public source identity/visibility
+is authenticated through GitHub. Every payload Git blob must match the public
+master tree. The exact allowed inventory, source SHA, selected tools, checkout pin
+and generated manual workflow are checked again before publication. Provenance
+contains no local paths or dirty-status data. If public master advances, restage
+rather than silently publishing stale or locally edited inputs.
+
+The two optional retained writing-checker oracle inputs (`check.py` and its
+development lexicon) are omitted without reading them when untracked. The public
+Rust lexical fixtures remain required; existing optional Python parity tests may
+explicitly skip without that oracle. Required ignored inputs still fail. This does
+not authorize adding private development files to public source or publication.
+
+Only the existing `selected()` source/test/dependency allowlist is staged; all six
+workspace members remain present for Cargo resolution even with a test subset.
+It excludes stores, credentials, logs, caches, development output and unrelated
+files. Literal Rust includes must resolve inside the snapshot. The SHA-256 manifest
+is integrity evidence, not permission to upload arbitrary files: recomputing it
+does not bypass public-source proof or workflow checks.
+
+Inspect the reported stage, then explicitly publish an unused snapshot branch:
+
+```bash
+python3 -B tools/build/private_ci.py verify --stage REVIEWED_STAGE
+python3 -B tools/build/private_ci.py publish-public --stage REVIEWED_STAGE --repo AlgebraLoveme/PIRA-validation --branch validation-UNUSED_NAME
+```
+
+Publication creates an independent root commit containing only the verified
+snapshot, never source Git history. It authenticates the pinned public repository
+ID/visibility before work and immediately before pushing, refuses the seed/default
+branch and existing branches, and uses an empty expected-value push lease. Source,
+stage, tags, releases and existing branches are not rewritten. Git ignores inherited
+repository/index overrides and disables hooks. The archive is untouched.
+
+## Dispatch once, separately, only with approval
+
+Every generated workflow is **workflow_dispatch only**: neither seed nor snapshot
+pushes start jobs. The clean seed contains reviewed tooling/docs and the manual
+workflow, not source snapshots; dispatching its default branch fails the initial
+manifest check before compiling. Choose the reviewed snapshot branch instead.
+The workflow's public jobs also require the dedicated name and numeric ID.
+
+First inspect runs for that exact branch/source and reuse already sufficient
+results. After approval, dispatch **once** for the intended subset:
+
+```bash
+gh run list --repo AlgebraLoveme/PIRA-validation --branch validation-UNUSED_NAME
+gh workflow run private-pira-tests.yml --repo AlgebraLoveme/PIRA-validation --ref validation-UNUSED_NAME
+```
+
+Do not dispatch while setup/user holds apply. A push is not a request for another
+run. For a genuine failed job on unchanged source, inspect its evidence and rerun
+only failed jobs after approval; do not repeat an entire successful matrix. Changed
+source requires a new reviewed snapshot, not reuse of stale acceptance. Focused
+Team test names are diagnostic evidence, not a replacement for the full required
+100-launch acceptance suite. Final reproducibility/release builds remain in PIRA's
+separate release workflow, unchanged by this helper.
+
+If a push response is lost, the error reports the intended commit and exact
+read-only `git ls-remote` recovery command. If that commit exists, do not republish
+or dispatch twice. If absent, retry unchanged publication; if another commit exists,
+choose a new branch. Never delete/force a branch. No automatic retry or dispatch is
+performed, and reviewed stages remain available after errors.
+
+## Private compatibility
+
+`stage` still stages allowlisted working-tree bytes, including uncommitted inputs,
+for local review or an explicitly chosen **private** compatibility destination.
+`publish --stage PATH --repo OWNER/REPO --branch NEW_BRANCH` still fails closed on
+nonprivate/mismatched destinations and now rejects the historical archive ID.
+These snapshots are also manual-only. Never pass a private snapshot to the public
+route; public publication rejects its provenance and nonpublic bytes. Public
+staging/publication intentionally require authenticated read-only API checks;
+`stage` and `verify` themselves remain local-only.
+
+## Retained native coverage
+
+The staged manual workflow reuses the exact checkout pin from the source release
+workflow, disables credential persistence, checks hashes, and runs locked crate
+tests on native Linux and Windows. Rust harness cases run serially to avoid
+timestamp-named fixture collisions and Unix fork-inherited owner locks; concurrency
+assertions within individual tests remain exercised. Team and the writing checker additionally run on native
+macOS. Each checker host runs
+debug and release Rust tests (including retained lexical expectations), formatting,
+and debug/release builds. Python CLI parity runs against both executable profiles
+when the retained oracle is available; otherwise its tests explicitly skip while
+Rust lexical fixtures still run. The snapshot always requires the checker's runtime
+`help.md`, `lexicon.json` and `tests/evaluation.json`; it optionally selects only
+`tools/dev/pira_write_check/check.py` and its `lexicon.json`, not the development tree.
+Two additional exact required dependencies are
+`tools/dev/pira_write_check/benchmark.py` and
+`tools/dev/pira_write_check/test_benchmark.py`; missing either fails staging.
+Each checker host (macOS, Linux, Windows) runs the three safe work-directory tests
+once, outside the debug/release parity loop:
+
+```bash
+python -B tools/dev/pira_write_check/test_benchmark.py -v
+```
+
+These tests mock the platform check and reject or stop before benchmark fixture
+generation; no measured binary, performance benchmark, or timeout signals run.
+Symlink creation must be permitted (including on Windows); only POSIX hosts check
+the new directory's private permission bits. The actual benchmark remains limited
+to macOS/Linux `/usr/bin/time` and POSIX process-group timeout handling; these safe
+tests do not validate performance or make the benchmark Windows-compatible.
+No other development-directory files are selected recursively.
+Before staging, the source owner must supply the checker manifest, Rust sources,
+tests and lexical fixtures, and update workspace membership and `Cargo.lock` together.
+This helper does not change them or any writing policy.
+
+A separate Linux/Windows setup job runs all explicitly staged setup tests: unified
+setup, tool/backend preflight, and store configuration.
+That job first builds source Ctx with locked Cargo into `tools/target` (45-minute
+job budget), then injects the absolute host `pira_ctx`/`pira_ctx.exe` path as
+`PIRA_TEST_CTX_BINARY` into the isolated test environment. The exact native event
+merge/post-use rerun regression must report success: missing executable, absent
+test, skip, expected failure or actual failure fails the job. This gate applies
+on both platforms even when the selected Rust test matrix excludes Ctx.
+Its home/temp environment is disposable and stripped of runner authentication values;
+unmocked Windows registry access is blocked, so tests must supply explicit registry
+fixtures. File/path operations use the host platform, not an emulated filesystem.
+Team's matrix jobs run full fake-backend contracts on Linux/macOS and the required
+lifecycle/output-delivery suite on Windows. All three require unstaggered 100-launch
+Codex and interleaved Codex/Claude bursts, including session isolation and cleanup.
+For exact local artifact checks, `native_ci.py` accepts `PIRA_TEAM_BIN` and
+`PIRA_DEC_BIN`; otherwise it uses source-built `tools/target/debug` executables.
+Explicit unittest names after `native_ci.py` select focused diagnostics after the
+normal platform discovery/imports. With no names, its normal full platform suite still requires both 100-launch cases and
+rejects runtime skips; focused runs do not satisfy that acceptance gate.
+SVG's Linux job
+uses `apt-get download` plus `dpkg-deb --extract` into runner-local temporary storage
+for a DejaVu-only font inventory, without sudo or host-font modification. These CI
+jobs need their normal network dependencies; local helper tests do not. Actual
+Actions execution is a separate maintainer-approved smoke, not part of the
+offline test suite.
+
+The setup snapshot explicitly selects `setup_pira.py`, `setup_pira_tools.py`,
+`setup_pira_stores.py`, `migrate_pira_stores.py`, their four test modules,
+`assets/LEGACY_LIST.md`, and the platform selector, alongside existing Team
+fixture/policy dependencies. Communication setup additionally requires these exact
+four paths (missing any one fails staging):
+
+- `assets/scripts/setup_pira_communication.py`
+- `assets/scripts/test_setup_pira_communication.py`
+- `assets/COMMUNICATION_AGENTS_TEMPLATE.md`
+- `assets/COMMUNICATION_WORKBOOK_TEMPLATE.md`
+
+The existing Linux/Windows setup job discovers the communication module's tests
+through `test_*.py` in this reviewed snapshot; no workflow change is needed. Both
+templates retain their `assets/` location for runtime lookup. Offline helper
+regressions check byte preservation and missing-dependency rejection, not native
+Linux/Windows execution. Maintain these exact inputs as dependencies change; never replace
+them with recursive script-directory copying. Migration verification precedes
+configuration publication in both entry points, including unified setup's
+`--skip-tools` route. Retained Team histories remain subject to the migration
+owner's fail-closed relocation checks; passing installer tests alone does not
+validate those histories.
+
+## Current native Team/setup target
+
+Both existing Linux and Windows Team matrix entries provision official stable
+Codex **0.166.0** in `RUNNER_TEMP/pira-team-native-codex`, using the explicit
+`provision_codex(..., profile="team")` target. Official release assets and SHA-256:
+
+- `codex-x86_64-unknown-linux-musl.tar.gz`: `a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978`
+- `codex-x86_64-pc-windows-msvc.exe.zip`: `bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d`
+
+These are downloaded from `https://github.com/openai/codex/releases/download/rust-v0.166.0/`.
+Linux retains its sole named executable. Windows retains the complete reviewed
+54-entry layout (48 files, six directories), including `bin/codex-exec-server.exe`;
+its exact manifest requires version 0.166.0 and that `execServer` path. All other
+inventory, path, mode, manifest, hash, empty-destination and isolation checks remain
+strict. Downloads and individual expanded files remain bounded to **512 MiB**;
+only this current target's aggregate Windows expansion ceiling is **1 GiB**.
+The observed Windows package expands to 615,131,495 bytes, above the old ceiling.
+
+Each host runs the actual setup `check_team_runtime(["pira_team"], binary)` check
+(stable version, required app-server flags, experimental protocol schema export
+and strict-config initialization), followed by both required ignored Rust native
+schema/project-trust tests. Missing, skipped, unsuccessful or timed-out checks fail
+the job. Runtime checks use a disposable allowlisted HOME/CODEX_HOME/environment;
+Windows exposes a task-local `codex.exe` copy beside the intact official layout,
+while Linux already has the `codex` entrypoint. No installation, login or model
+calls occur. Local helper regressions mock executables; actual native host passes
+require the separate approved Actions run.
+
+## Pinned historical native relocation job
+
+The independent `native_relocation` job targets x64 Linux and Windows and provisions
+only official Codex **0.161.0** under `RUNNER_TEMP/pira-relocation-codex`. The helper
+constructs the `openai/codex/releases/download/rust-v0.161.0` URLs and verifies these
+user-approved SHA-256 pins before extracting or executing any binary:
+
+- `codex-x86_64-unknown-linux-musl.tar.gz`: `b1efb95097660d7f2e5a3887618a23f2ea1b0d548078bf92b0f7a5d229a0cef2`
+- `codex-x86_64-pc-windows-msvc.exe.zip`: `a7493348634867c905f7298211923c57eb01dfe45400207a423c5453b190b11a`
+
+The default provisioner and `provision-codex` CLI remain historical 0.161.0;
+download, per-file and aggregate extraction bounds remain **512 MiB**. Current
+Team/setup checks do not promote this historical fixture, its format admission,
+retained-history migration guards or receipts to 0.166.0.
+
+Linux extraction accepts exactly the asset's named executable member. Windows
+extraction accepts the exact 53-entry official 0.161.0 package inventory (47 files,
+6 directories), validates its package manifest and preserves all sibling executables,
+`codex-path` and `codex-resources` including voice DLLs/licenses. The manifest's
+`codex-x86_64-pc-windows-msvc.exe` entrypoint is retained without renaming and passed
+to the native fixture; resources/path directory relationships stay intact. No
+archive paths outside this literal inventory, duplicate entries, links, encrypted
+members or nonregular files are accepted. Per-file and total expanded sizes are
+bounded; extraction uses a fresh empty directory and exclusive file creation. The
+download is bounded too, an existing destination is never refreshed, and `--version` must return
+`codex-cli 0.161.0` in an isolated credential-free home before publication. No PATH,
+registry, login, privilege or developer-mode changes are made.
+
+Staging now requires the maintained `team_store_relocation.py`,
+`test_team_store_relocation.py`, and `team_relocation_fixture.py` inputs explicitly.
+Missing inputs fail staging; managed artifacts are not copied into snapshots.
+The required job runs the maintained deterministic suite (`test_team_store_relocation.py -v`)
+and `test_team_store_relocation.py --native --completed-turns --scratch ABSOLUTE_PARENT
+--binary ABSOLUTE_CODEX`. Both run even if the deterministic suite fails; either
+failure fails the job. Each command has an eight-minute timeout. The fresh task-local
+HOME/CODEX_HOME and allowlisted environment exclude runner authentication; inference
+uses only the fixture's scripted localhost Responses server. No registry access,
+login, real user stores, privilege changes or paid calls are requested.
+
+The fixture checks three threads with two completed turns each, full paginated
+history, alias-removed resume, original hashes, destination writes and rollback.
+It also exercises the public setup transaction into a nonempty destination, one
+real continuation turn, receipt reruns without initial repair, read-only modes and
+the configuration-publication barrier. Windows uses directory junctions and
+explicitly forbids symlink creation in the fixture. Missing required alias or
+listener support fails visibly, never as a skip.
+
+The fixture uses production admission on validated platforms. Candidate-only
+admission is a reversible test override for freshly generated fixtures, reported
+separately. A passing job does not change the production platform/format allowlist
+or migrate user data; `verified_fixture_only` describes this test boundary.
+
+Synthetic command output, result.json, repair/failure journals and native.stderr
+are retained under `RUNNER_TEMP/pira-relocation-evidence` and replayed in
+Actions logs (JSON-escaped lines), including on failure. No home/auth files or
+rollout records are uploaded. Runner-local files expire with the runner; the job
+logs preserve these diagnostics. Forced job cancellation can prevent final replay.
+Local offline tests check invocation, isolation, staging and failure propagation;
+they do not claim a native Linux/Windows completed-turn pass.
