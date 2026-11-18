@@ -1,0 +1,12 @@
+{
+  "source_repository": "AlgebraLoveme/PIRA",
+  "source_sha": "2cad90d0e105eef66a7a237b7b28afcb31ec66a1",
+  "tested_tools": [
+    "pira_ctx",
+    "pira_dec",
+    "pira_nav",
+    "pira_svg_check",
+    "pira_team",
+    "pira_write_check"
+  ]
+}
