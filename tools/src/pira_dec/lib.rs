@@ -1,0 +1,776 @@
+mod cli;
+mod export;
+mod model;
+mod storage;
+mod util;
+#[cfg(windows)]
+mod windows;
+
+use cli::{Command, SearchField};
+use model::{DecisionRecord, DecisionView};
+use regex::Regex;
+use serde::Serialize;
+use std::path::Path;
+
+pub fn run() -> i32 {
+    match real_main() {
+        Ok(code) => code,
+        Err(error) if error == util::BROKEN_PIPE => 0,
+        Err(error) => {
+            util::stderr_line(format_args!(
+                "pira_dec: {}",
+                util::escape_diagnostic(&error)
+            ));
+            2
+        }
+    }
+}
+
+fn real_main() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| "command-line arguments must be valid UTF-8".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let config = cli::parse_args(&args)?;
+    let store = config.store_dir.as_deref();
+    match config.command {
+        Command::Help(topic) => {
+            util::stdout_text(topic.text())?;
+            Ok(0)
+        }
+        Command::Version => {
+            util::stdout_line(&format!("pira_dec {}", env!("CARGO_PKG_VERSION")))?;
+            Ok(0)
+        }
+        Command::Add(draft) => run_add(store, draft),
+        Command::Show { id, json } => run_show(store, &id, json),
+        Command::List {
+            since,
+            until,
+            limit,
+            json,
+        } => run_list(store, since.as_deref(), until.as_deref(), limit, json),
+        Command::Export {
+            output,
+            since,
+            until,
+            limit,
+        } => run_export(store, &output, since.as_deref(), until.as_deref(), limit),
+        Command::Search {
+            field,
+            pattern,
+            since,
+            until,
+            limit,
+            json,
+        } => run_search(
+            store,
+            field,
+            pattern.as_deref(),
+            since.as_deref(),
+            until.as_deref(),
+            limit,
+            json,
+        ),
+        Command::Forget { id, confirmed } => run_forget(store, &id, confirmed),
+    }
+}
+
+fn run_export(
+    store: Option<&Path>,
+    output: &Path,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: Option<usize>,
+) -> Result<i32, String> {
+    let (since_ms, until_ms) = parse_time_window("export", since, until)?;
+    let (records, skipped) = load_export_records(store, since_ms, until_ms, limit)?;
+    let html = export::render(&records, skipped.len())?;
+    util::write_private_new(output, html.as_bytes())?;
+    util::stdout_line(&format!(
+        "{} | {} {}",
+        util::single_line_clip(&output.display().to_string(), 300),
+        records.len(),
+        if records.len() == 1 {
+            "decision"
+        } else {
+            "decisions"
+        }
+    ))?;
+    Ok(0)
+}
+
+fn run_add(store: Option<&Path>, draft: model::DecisionDraft) -> Result<i32, String> {
+    let record = storage::add(store, draft)?;
+    util::stdout_line(&format!(
+        "{} | {}",
+        record.id,
+        util::single_line_clip(record.selected_text()?, 200)
+    ))?;
+    Ok(0)
+}
+
+fn run_show(store: Option<&Path>, id: &str, json: bool) -> Result<i32, String> {
+    let layout = storage::Layout::current(store)?;
+    let path = match storage::resolve(&layout, id, false)? {
+        storage::Resolution::Missing => {
+            util::stderr_line(format_args!("pira_dec: no decision matches {id:?}"));
+            return Ok(1);
+        }
+        storage::Resolution::Ambiguous => {
+            util::stderr_line(format_args!(
+                "pira_dec: decision prefix is ambiguous: {id:?}; use a complete ID from pira_dec list --limit 20"
+            ));
+            return Ok(1);
+        }
+        storage::Resolution::Found(path) => path,
+    };
+    let record = match storage::read_record(&path) {
+        Ok(record) => record,
+        Err(storage::ReadFailure::Vanished) => {
+            util::stderr_line(format_args!(
+                "pira_dec: decision vanished before it could be read"
+            ));
+            return Ok(1);
+        }
+        Err(storage::ReadFailure::Invalid(error)) => return Err(error),
+    };
+    if json {
+        print_json(&record.view()?)?;
+    } else {
+        print_human_record(&record)?;
+    }
+    Ok(0)
+}
+
+#[derive(Serialize)]
+struct SkippedRecord {
+    filename: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct SearchOutput {
+    matches: Vec<DecisionView>,
+    has_more: bool,
+    skipped_count: usize,
+    skipped: Vec<SkippedRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListDecision {
+    id: String,
+    timestamp: String,
+    decision: String,
+}
+
+#[derive(Serialize)]
+struct ListOutput {
+    decisions: Vec<ListDecision>,
+    has_more: bool,
+    skipped_count: usize,
+    skipped: Vec<SkippedRecord>,
+}
+
+fn run_list(
+    store: Option<&Path>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<i32, String> {
+    let (since_ms, until_ms) = parse_time_window("list", since, until)?;
+    let (records, skipped, has_more) = load_bounded_records(store, limit, |record| {
+        Ok(time_matches(record, since_ms, until_ms))
+    })?;
+    let decisions = collect_list_decisions(records, since_ms, until_ms, limit)?;
+    if json {
+        let output = ListOutput {
+            decisions,
+            has_more,
+            skipped_count: skipped.len(),
+            skipped,
+        };
+        print_json(&output)?;
+    } else {
+        if decisions.is_empty() {
+            util::stdout_line("decisions=0")?;
+        }
+        for decision in decisions {
+            util::stdout_line(&format_list_row(&decision))?;
+        }
+        print_limit_notice(limit, has_more)?;
+    }
+    Ok(0)
+}
+
+fn collect_list_decisions(
+    records: Vec<DecisionRecord>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    limit: usize,
+) -> Result<Vec<ListDecision>, String> {
+    let mut decisions = Vec::new();
+    for record in records {
+        if !time_matches(&record, since_ms, until_ms) {
+            continue;
+        }
+        let timestamp = util::format_rfc3339(record.timestamp_ms)?;
+        let decision = record.selected_text()?.to_string();
+        decisions.push(ListDecision {
+            id: record.id,
+            timestamp,
+            decision,
+        });
+        if decisions.len() == limit {
+            break;
+        }
+    }
+    Ok(decisions)
+}
+
+fn format_list_row(decision: &ListDecision) -> String {
+    format!(
+        "{} | {}",
+        decision.id,
+        util::single_line_clip(&decision.decision, 200)
+    )
+}
+
+fn run_search(
+    store: Option<&Path>,
+    field: Option<SearchField>,
+    pattern: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<i32, String> {
+    let expression = match (field, pattern) {
+        (Some(field), Some(pattern)) => Some((
+            Some(field),
+            Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?,
+        )),
+        (None, Some(query)) => Some((
+            None,
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| format!("invalid query: {error}"))?,
+        )),
+        (None, None) => None,
+        _ => return Err("search requires --field and --regex together".into()),
+    };
+    let (since_ms, until_ms) = parse_time_window("search", since, until)?;
+    let (records, skipped, has_more) = load_bounded_records(store, limit, |record| {
+        if !time_matches(record, since_ms, until_ms) {
+            return Ok(false);
+        }
+        match expression.as_ref() {
+            Some((Some(field), regex)) => record_matches(record, *field, regex),
+            Some((None, regex)) => Ok(regex.is_match(&record.context)
+                || record.choices.iter().any(|choice| regex.is_match(choice))),
+            None => Ok(true),
+        }
+    })?;
+    let matches = records
+        .iter()
+        .map(DecisionRecord::view)
+        .collect::<Result<Vec<_>, _>>()?;
+    let found = !matches.is_empty();
+    if json {
+        let output = SearchOutput {
+            matches,
+            has_more,
+            skipped_count: skipped.len(),
+            skipped,
+        };
+        print_json(&output)?;
+    } else {
+        if !found {
+            util::stdout_line(&format!(
+                "decisions_matched=0 complete={}{}",
+                usize::from(skipped.is_empty()),
+                if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" skipped={}", skipped.len())
+                }
+            ))?;
+        }
+        for record in matches {
+            let evidence = expression.as_ref().and_then(|(field, regex)| match field {
+                None => match_excerpt(&record.context, regex).or_else(|| {
+                    record
+                        .choices
+                        .iter()
+                        .find_map(|choice| match_excerpt(choice, regex))
+                }),
+                Some(SearchField::Context) => match_excerpt(&record.context, regex),
+                Some(SearchField::Choice) => record
+                    .choices
+                    .iter()
+                    .find_map(|choice| match_excerpt(choice, regex)),
+                _ => None,
+            });
+            let mut row = format!(
+                "{} | {} | {}",
+                record.id,
+                record.maker,
+                util::single_line_clip(&record.decision_text, 200)
+            );
+            if let Some(evidence) = evidence {
+                row.push_str(&format!(" | match={evidence}"));
+            }
+            util::stdout_line(&row)?;
+        }
+        print_limit_notice(limit, has_more)?;
+    }
+    Ok(if found { 0 } else { 1 })
+}
+
+fn parse_time_window(
+    command: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    let (since_time, until_time) = if since.is_some() || until.is_some() {
+        let now_ms = util::now_ms()?;
+        (
+            since
+                .map(|value| util::parse_time_bound(value, now_ms))
+                .transpose()?,
+            until
+                .map(|value| util::parse_time_bound(value, now_ms))
+                .transpose()?,
+        )
+    } else {
+        (None, None)
+    };
+    if since_time
+        .zip(until_time)
+        .is_some_and(|(since, until)| since >= until)
+    {
+        return Err(format!("{command} --since must be earlier than --until"));
+    }
+    // Records have millisecond precision. Ceiling both bounds preserves >= and <
+    // membership, but window validity must be checked before rounding.
+    let ceil_ms = |time: jiff::Timestamp| ((time.as_nanosecond() + 999_999) / 1_000_000) as u64;
+    Ok((since_time.map(ceil_ms), until_time.map(ceil_ms)))
+}
+
+fn match_excerpt(text: &str, regex: &Regex) -> Option<String> {
+    let matched = regex.find(text)?;
+    let mut start = matched.start().saturating_sub(60);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (matched.start() + 140).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        util::single_line_clip(&text[start..end], 200),
+        if end < text.len() { "…" } else { "" }
+    ))
+}
+
+fn print_limit_notice(limit: usize, has_more: bool) -> Result<(), String> {
+    if has_more {
+        util::stdout_line(&format!(
+            "shown={limit} has_more=1 limit={limit}; narrow filters or raise --limit (max 1000)"
+        ))?;
+    }
+    Ok(())
+}
+
+struct RankedRecord(DecisionRecord);
+impl PartialEq for RankedRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for RankedRecord {}
+impl PartialOrd for RankedRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RankedRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0.timestamp_ms, &self.0.id).cmp(&(other.0.timestamp_ms, &other.0.id))
+    }
+}
+
+fn load_bounded_records(
+    store: Option<&Path>,
+    limit: usize,
+    mut matches: impl FnMut(&DecisionRecord) -> Result<bool, String>,
+) -> Result<(Vec<DecisionRecord>, Vec<SkippedRecord>, bool), String> {
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut total = 0usize;
+    let skipped = visit_records(store, |record| {
+        if matches(&record)? {
+            total += 1;
+            retain_newest(&mut heap, record, limit);
+        }
+        Ok(())
+    })?;
+    let mut records = heap.into_iter().map(|r| r.0.0).collect::<Vec<_>>();
+    sort_records_newest_first(&mut records);
+    Ok((records, skipped, total > limit))
+}
+
+fn retain_newest(
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<RankedRecord>>,
+    record: DecisionRecord,
+    limit: usize,
+) {
+    heap.push(std::cmp::Reverse(RankedRecord(record)));
+    if heap.len() > limit {
+        heap.pop();
+    }
+}
+
+fn load_export_records(
+    store: Option<&Path>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    limit: Option<usize>,
+) -> Result<(Vec<DecisionRecord>, Vec<SkippedRecord>), String> {
+    if let Some(limit) = limit {
+        let (records, skipped, _) = load_bounded_records(store, limit, |record| {
+            Ok(time_matches(record, since_ms, until_ms))
+        })?;
+        return Ok((records, skipped));
+    }
+    let mut records = Vec::new();
+    let skipped = visit_records(store, |record| {
+        if time_matches(&record, since_ms, until_ms) {
+            records.push(record);
+        }
+        Ok(())
+    })?;
+    sort_records_newest_first(&mut records);
+    Ok((records, skipped))
+}
+
+fn visit_records(
+    store: Option<&Path>,
+    mut visit: impl FnMut(DecisionRecord) -> Result<(), String>,
+) -> Result<Vec<SkippedRecord>, String> {
+    let layout = storage::Layout::current(store)?;
+    let mut skipped = Vec::new();
+    for path in storage::record_paths(&layout)? {
+        match storage::read_record(&path) {
+            Ok(record) => visit(record)?,
+            Err(storage::ReadFailure::Vanished) => {}
+            Err(storage::ReadFailure::Invalid(error)) => {
+                let filename = filename_only(&path);
+                if skipped.len() < 8 {
+                    util::stderr_line(format_args!(
+                        "pira_dec: skipped {}: {}",
+                        filename,
+                        util::single_line_clip(&error, 300)
+                    ));
+                }
+                skipped.push(SkippedRecord {
+                    filename,
+                    error: util::single_line_clip(&error, 300),
+                });
+            }
+        }
+    }
+    if skipped.len() > 8 {
+        util::stderr_line(format_args!(
+            "pira_dec: skipped={} warnings_omitted={}; use search --json for record details",
+            skipped.len(),
+            skipped.len() - 8
+        ));
+    }
+    Ok(skipped)
+}
+
+fn sort_records_newest_first(records: &mut [DecisionRecord]) {
+    records.sort_by(|left, right| {
+        right
+            .timestamp_ms
+            .cmp(&left.timestamp_ms)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
+fn time_matches(record: &DecisionRecord, since_ms: Option<u64>, until_ms: Option<u64>) -> bool {
+    since_ms.is_none_or(|since| record.timestamp_ms >= since)
+        && until_ms.is_none_or(|until| record.timestamp_ms < until)
+}
+
+fn run_forget(store: Option<&Path>, id: &str, confirmed: bool) -> Result<i32, String> {
+    if !confirmed {
+        return Err("forget requires explicit --yes".into());
+    }
+    model::validate_id_syntax(id)?;
+    let layout = storage::Layout::current(store)?;
+    match storage::delete_exact(&layout, id)? {
+        Some(record) => {
+            util::stdout_line(&format!(
+                "{} | {}",
+                record.id,
+                util::single_line_clip(record.selected_text()?, 200)
+            ))?;
+            Ok(0)
+        }
+        None => {
+            util::stderr_line(format_args!("pira_dec: no exact decision {id:?}"));
+            Ok(1)
+        }
+    }
+}
+
+fn record_matches(
+    record: &DecisionRecord,
+    field: SearchField,
+    regex: &Regex,
+) -> Result<bool, String> {
+    Ok(match field {
+        SearchField::Id => regex.is_match(&record.id),
+        SearchField::Context => regex.is_match(&record.context),
+        SearchField::Choice => record.choices.iter().any(|choice| regex.is_match(choice)),
+        SearchField::Decision => regex.is_match(record.selected_text()?),
+        SearchField::Maker => regex.is_match(record.maker.as_str()),
+        SearchField::Relation => {
+            record
+                .supersedes
+                .as_deref()
+                .is_some_and(|id| regex.is_match(id))
+                || record.related.iter().any(|id| regex.is_match(id))
+        }
+        SearchField::Timestamp => regex.is_match(&util::format_rfc3339(record.timestamp_ms)?),
+    })
+}
+
+fn print_human_record(record: &DecisionRecord) -> Result<(), String> {
+    let mut output = String::new();
+    output.push_str(&format!("ID: {}\n", record.id));
+    output.push_str(&format!(
+        "Timestamp: {} ({})\n",
+        util::format_rfc3339(record.timestamp_ms)?,
+        record.timestamp_ms
+    ));
+    output.push_str(&format!("Maker: {}\n", record.maker.as_str()));
+    if let Some(id) = &record.supersedes {
+        output.push_str(&format!("Supersedes: {id}\n"));
+    }
+    if !record.related.is_empty() {
+        output.push_str(&format!("Related: {}\n", record.related.join(", ")));
+    }
+    output.push_str("Context:\n");
+    output.push_str(&record.context);
+    output.push_str("\nChoices:\n");
+    for (index, choice) in record.choices.iter().enumerate() {
+        let selected = if index + 1 == record.decision as usize {
+            " [selected]"
+        } else {
+            ""
+        };
+        output.push_str(&format!("  {}. {}{}\n", index + 1, choice, selected));
+    }
+    output.push_str(&format!("Decision: {}\n", record.decision));
+    let mut safe = String::with_capacity(output.len());
+    for character in output.chars() {
+        if (character.is_control() && !matches!(character, '\n' | '\t'))
+            || util::is_bidi_control(character)
+        {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    util::stdout_text(&safe)
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    util::stdout_text(&json)
+}
+
+fn filename_only(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| util::single_line_clip(value, 200))
+        .unwrap_or_else(|| "<invalid-filename>".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Maker;
+
+    fn record(timestamp_ms: u64) -> DecisionRecord {
+        DecisionRecord {
+            id: format!(
+                "D-{}-{timestamp_ms:016x}",
+                util::format_id_timestamp(timestamp_ms).unwrap()
+            ),
+            timestamp_ms,
+            context: "Choose cache format".into(),
+            choices: vec!["SQLite".into(), "JSON".into()],
+            decision: 1,
+            maker: Maker::Agent,
+            supersedes: None,
+            related: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_selection_retains_only_limit_payloads() {
+        for limit in [1, 3] {
+            let mut heap = std::collections::BinaryHeap::new();
+            // Generate payloads lazily: this fixture itself never holds the history.
+            for index in 0..128 {
+                let mut record = record((index * 13) % 128);
+                record.context = "x".repeat(4_096);
+                retain_newest(&mut heap, record, limit);
+                assert!(heap.len() <= limit);
+                assert!(heap.iter().map(|r| r.0.0.context.len()).sum::<usize>() <= limit * 4_096);
+            }
+            assert_eq!(heap.len(), limit);
+            assert_eq!(heap.peek().unwrap().0.0.timestamp_ms, 128 - limit as u64);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn export_filters_limits_orders_and_reports_corruption() {
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!("pira-dec-export-{}", util::nonce_hex()));
+        std::fs::create_dir(&path).unwrap();
+        let sandbox = Sandbox(path.canonicalize().unwrap());
+        let layout = storage::Layout::current(Some(&sandbox.0)).unwrap();
+        layout.prepare_for_write().unwrap();
+        let mut reference = Vec::new();
+        for index in 0..32 {
+            let timestamp_ms = ((index * 13) % 32) / 2 * 1_000;
+            let mut record = record(timestamp_ms);
+            record.id = format!(
+                "D-{}-{index:016x}",
+                util::format_id_timestamp(timestamp_ms).unwrap()
+            );
+            record.context = format!("record-{index:02} {}", "x".repeat(4_096));
+            util::write_private_new(
+                &layout.records_dir.join(format!("{}.piradec", record.id)),
+                &model::encode(&record).unwrap(),
+            )
+            .unwrap();
+            reference.push(record);
+        }
+        // More than eight corrupt records also exercise the warning-summary path.
+        for index in 0..9 {
+            util::write_private_new(
+                &layout.records_dir.join(format!("bad-{index}.piradec")),
+                b"invalid",
+            )
+            .unwrap();
+        }
+        // Independent full-sort reference; do not reuse the selection comparator.
+        reference.sort_by_key(|record| std::cmp::Reverse((record.timestamp_ms, record.id.clone())));
+        for (index, (since, until, limit, expected_count)) in [
+            (None, None, None, 32),
+            (None, None, Some(1), 1),
+            (Some(3_000), Some(7_000), None, 8),
+            (Some(3_000), Some(7_000), Some(3), 3),
+            (Some(3_000), Some(7_000), Some(8), 8),
+            (Some(100_000), None, None, 0),
+            (Some(100_000), None, Some(1), 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected: Vec<_> = reference
+                .iter()
+                .filter(|record| {
+                    since.is_none_or(|since| record.timestamp_ms >= since)
+                        && until.is_none_or(|until| record.timestamp_ms < until)
+                })
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect();
+            assert_eq!(expected.len(), expected_count);
+            let since = since.map(|time| util::format_rfc3339(time).unwrap());
+            let until = until.map(|time| util::format_rfc3339(time).unwrap());
+            let output = sandbox.0.join(format!("export-{index}.html"));
+            assert_eq!(
+                run_export(
+                    Some(&sandbox.0),
+                    &output,
+                    since.as_deref(),
+                    until.as_deref(),
+                    limit
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                export::render(&expected, 9).unwrap()
+            );
+            util::check_private_file(&std::fs::File::open(&output).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn time_window_is_since_inclusive_and_until_exclusive() {
+        let record = record(2_000);
+        assert!(time_matches(&record, Some(2_000), Some(2_001)));
+        assert!(!time_matches(&record, Some(2_001), None));
+        assert!(!time_matches(&record, None, Some(2_000)));
+    }
+
+    #[test]
+    fn fractional_bounds_preserve_membership_and_window_order() {
+        let lower = "1970-01-01T00:00:02.000000001Z";
+        let upper = "1970-01-01T00:00:02.000999999Z";
+        let (since, _) = parse_time_window("list", Some(lower), None).unwrap();
+        let (_, until) = parse_time_window("list", None, Some(lower)).unwrap();
+        assert!(!time_matches(&record(2_000), since, None));
+        assert!(time_matches(&record(2_000), None, until));
+        assert!(!time_matches(&record(2_001), None, until));
+        let (since, until) = parse_time_window("list", Some(lower), Some(upper)).unwrap();
+        assert_eq!((since, until), (Some(2_001), Some(2_001)));
+        assert!(!time_matches(&record(2_001), since, until));
+        assert!(parse_time_window("list", Some(upper), Some(lower)).is_err());
+        assert!(parse_time_window("list", Some(lower), Some(lower)).is_err());
+    }
+
+    #[test]
+    fn list_is_newest_first_bounded_and_concise() {
+        let mut records = vec![record(1_000), record(3_000), record(2_000)];
+        sort_records_newest_first(&mut records);
+        let decisions = collect_list_decisions(records, Some(2_000), Some(4_000), 1).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].id.ends_with("0000000000000bb8"));
+
+        let row = format_list_row(&decisions[0]);
+        assert!(row.contains("SQLite"));
+        assert_eq!(row.matches(" | ").count(), 1);
+        assert!(!row.contains("Choose cache format"));
+        assert!(!row.contains("agent"));
+        let json = serde_json::to_value(&decisions[0]).unwrap();
+        let keys = json.as_object().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains_key("id"));
+        assert!(keys.contains_key("timestamp"));
+        assert!(keys.contains_key("decision"));
+    }
+}
