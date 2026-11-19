@@ -1,0 +1,867 @@
+use crate::model::{DecisionDraft, Maker};
+use std::path::PathBuf;
+
+const MAX_REGEX_BYTES: usize = 4 * 1024;
+const MAX_TIME_BYTES: usize = 256;
+
+pub const HELP: &str = r#"pira_dec records, retrieves, and exports medium-level workspace decisions.
+
+USAGE
+  pira_dec add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
+  pira_dec show ID [--json] [--store-dir PATH]
+  pira_dec list [--since TIME] [--until TIME] [--limit N] [--json] [--store-dir PATH]
+  pira_dec export --output FILE [--since TIME] [--until TIME] [--limit N] [--store-dir PATH]
+  pira_dec search [QUERY | --field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+                       [--limit N] [--json] [--store-dir PATH]
+  pira_dec forget EXACT_ID --yes [--store-dir PATH]
+  pira_dec help [COMMAND]
+
+Records are scoped to the nearest Git root, otherwise the current directory.
+Reads are lock-free and may omit a decision published concurrently.
+macOS/Linux writes require private permissions, hard links and directory sync.
+Windows writes use private DACLs, owner locks, atomic no-overwrite publication and file flush;
+crash persistence of Windows file/directory entries is not promised.
+macOS ACL grants are rejected, not removed; deny-only ACLs are supported.
+Run `pira_dec COMMAND --help` for exact fields, options, and behavior.
+"#;
+
+const ADD_HELP: &str = r#"pira_dec add — record one concluded workspace decision
+
+USAGE
+  pira_dec add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
+
+FIELDS
+  --context TEXT    Concise problem and decisive constraints; exactly once.
+  --choice TEXT     Seriously considered alternative; repeat for two or more unique choices.
+  --decision N      One-based index selecting one listed choice.
+  --maker VALUE     Decision authority: human or agent; required. Repeats are accepted;
+                    human takes precedence over agent regardless of order.
+  --supersedes ID   Exact existing decision replaced by this decision; at most once.
+  --related ID      Exact existing related decision; repeatable.
+
+OPTIONS
+  --store-dir PATH  Override the per-user store. Windows flushes contents, not directory entries.
+                   macOS ACL grants are rejected; deny-only ACLs are preserved.
+  -h, --help        Show this help.
+"#;
+
+const SHOW_HELP: &str = r#"pira_dec show — display one validated decision record
+
+USAGE
+  pira_dec show ID [--json] [--store-dir PATH]
+
+ID may be complete or an unambiguous prefix. The requested record is integrity-checked before
+display. Text output identifies the selected choice by index without repeating its body.
+Use --json for stable programmatic output.
+"#;
+
+const LIST_HELP: &str = r#"pira_dec list — show recent decisions concisely
+
+USAGE
+  pira_dec list [--since TIME] [--until TIME] [--limit N] [--json] [--store-dir PATH]
+
+Results are newest first. Default rows contain only ID and selected decision text; context,
+alternatives, maker, and a separate timestamp are omitted. --limit accepts 1..1000 and defaults to 20.
+TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since is inclusive and --until
+exclusive. An empty list prints decisions=0 and succeeds. Extra matching records trigger a limit
+notice; JSON includes has_more. Invalid unrelated records are skipped with bounded warnings.
+Use --json for structured rows, skipped_count, and full skipped-record details.
+"#;
+
+const EXPORT_HELP: &str = r#"pira_dec export — write standalone human-readable decision HTML
+
+USAGE
+  pira_dec export --output FILE [--since TIME] [--until TIME] [--limit N] [--store-dir PATH]
+
+Exports all workspace decisions by default, newest first. --since is inclusive; --until is exclusive;
+TIME accepts RFC 3339, `now`, or an age such as 30m, 24h, or 7d. An explicit --limit accepts 1..1000.
+The static HTML contains full context, alternatives, selected choice, maker, and timestamp. It uses no
+scripts or external resources and escapes stored text. FILE is private (Unix 0600; Windows protected
+process-user DACL), content-synced and never overwritten. macOS ACL grants are rejected before
+writing bytes; deny-only ACLs are preserved.
+Contents are synced; crash-durable publication of the output directory entry is not promised.
+"#;
+
+const SEARCH_HELP: &str = r#"pira_dec search — filter workspace decisions
+
+USAGE
+  pira_dec search [QUERY | --field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+                       [--limit N] [--json] [--store-dir PATH]
+
+FIELDS
+  id         Generated decision ID.
+  context    Decision context.
+  choice     Every considered alternative.
+  decision   Selected choice text only.
+  maker      human or agent.
+  relation   Superseded and related decision IDs.
+  timestamp  RFC 3339 UTC timestamp.
+
+QUERY is a nonempty case-insensitive literal across context and all choices, including the selected
+choice. Each record appears once with a bounded matching excerpt. Do not combine QUERY with
+--field/--regex. Put options before `--` when QUERY starts with a dash.
+
+TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since includes records at or after its
+bound; --until excludes records at or after its bound. Use a query, a field/regex pair, a time bound,
+or combine either text search with time bounds. Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are
+newest first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records,
+reports them with bounded warnings, and may omit a record published concurrently. Rows include ID,
+maker, and selected text; context/choice searches add match-local excerpts, without a separate
+timestamp. Extra matches trigger a limit notice. JSON includes has_more, skipped_count, and full
+skipped-record details; has_more describes the result limit, not skipped-record completeness. A human-readable search with no matches prints an explicit
+`decisions_matched=0` status and exits 1.
+
+EXAMPLES
+  pira_dec search cache --limit 5
+  pira_dec search --since 7d --limit 20
+  pira_dec search --field context --regex '(?i)cache' --since 30d
+"#;
+
+const FORGET_HELP: &str = r#"pira_dec forget — logically delete one exact decision record
+
+USAGE
+  pira_dec forget EXACT_ID --yes [--store-dir PATH]
+
+The complete ID and explicit --yes are required. Deletion removes the managed record but does not
+claim secure physical erasure. Windows deletion does not promise crash persistence of the directory-entry change.
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelpTopic {
+    Global,
+    Add,
+    Show,
+    List,
+    Export,
+    Search,
+    Forget,
+}
+
+impl HelpTopic {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Global => HELP,
+            Self::Add => ADD_HELP,
+            Self::Show => SHOW_HELP,
+            Self::List => LIST_HELP,
+            Self::Export => EXPORT_HELP,
+            Self::Search => SEARCH_HELP,
+            Self::Forget => FORGET_HELP,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SearchField {
+    Id,
+    Context,
+    Choice,
+    Decision,
+    Maker,
+    Relation,
+    Timestamp,
+}
+
+impl SearchField {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "id" => Ok(Self::Id),
+            "context" => Ok(Self::Context),
+            "choice" => Ok(Self::Choice),
+            "decision" => Ok(Self::Decision),
+            "maker" => Ok(Self::Maker),
+            "relation" => Ok(Self::Relation),
+            "timestamp" => Ok(Self::Timestamp),
+            _ => Err(format!(
+                "unknown search field {value:?}; expected id, context, choice, decision, maker, relation, or timestamp"
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Help(HelpTopic),
+    Version,
+    Add(DecisionDraft),
+    Show {
+        id: String,
+        json: bool,
+    },
+    List {
+        since: Option<String>,
+        until: Option<String>,
+        limit: usize,
+        json: bool,
+    },
+    Export {
+        output: PathBuf,
+        since: Option<String>,
+        until: Option<String>,
+        limit: Option<usize>,
+    },
+    Search {
+        field: Option<SearchField>,
+        pattern: Option<String>,
+        since: Option<String>,
+        until: Option<String>,
+        limit: usize,
+        json: bool,
+    },
+    Forget {
+        id: String,
+        confirmed: bool,
+    },
+}
+
+#[derive(Debug)]
+pub struct Config {
+    pub command: Command,
+    pub store_dir: Option<PathBuf>,
+}
+
+pub fn parse_args(args: &[String]) -> Result<Config, String> {
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(Config {
+            command: Command::Help(HelpTopic::Global),
+            store_dir: None,
+        });
+    };
+    match command {
+        "-h" | "--help" => simple(Command::Help(HelpTopic::Global), &args[1..]),
+        "help" => parse_help(&args[1..]),
+        "-V" | "--version" | "version" => simple(Command::Version, &args[1..]),
+        "add" => parse_add(&args[1..]),
+        "show" => parse_show(&args[1..]),
+        "list" => parse_list(&args[1..]),
+        "export" => parse_export(&args[1..]),
+        "search" => parse_search(&args[1..]),
+        "forget" => parse_forget(&args[1..]),
+        _ => Err(format!("unknown command {command:?}; run pira_dec --help")),
+    }
+}
+
+fn parse_help(args: &[String]) -> Result<Config, String> {
+    let topic = match args {
+        [] => HelpTopic::Global,
+        [command] => match command.as_str() {
+            "add" => HelpTopic::Add,
+            "show" => HelpTopic::Show,
+            "list" => HelpTopic::List,
+            "export" => HelpTopic::Export,
+            "search" => HelpTopic::Search,
+            "forget" => HelpTopic::Forget,
+            _ => return Err(format!("unknown help command {command:?}")),
+        },
+        _ => return Err("help accepts at most one command".into()),
+    };
+    simple(Command::Help(topic), &[])
+}
+
+fn simple(command: Command, remaining: &[String]) -> Result<Config, String> {
+    if !remaining.is_empty() {
+        return Err("help and version do not accept arguments".into());
+    }
+    Ok(Config {
+        command,
+        store_dir: None,
+    })
+}
+
+fn parse_add(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::Add), &[]);
+    }
+    let mut context = None;
+    let mut choices = Vec::new();
+    let mut decision = None;
+    let mut maker = None;
+    let mut supersedes = None;
+    let mut related = Vec::new();
+    let mut store_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--context" => set_once(
+                &mut context,
+                value(args, &mut index, "--context")?,
+                "--context",
+            )?,
+            "--choice" => choices.push(value(args, &mut index, "--choice")?),
+            "--decision" => {
+                let raw = value(args, &mut index, "--decision")?;
+                let parsed = raw
+                    .parse::<u32>()
+                    .map_err(|_| "--decision must be an unsigned integer".to_string())?;
+                set_once(&mut decision, parsed, "--decision")?;
+            }
+            "--maker" => {
+                let next = Maker::parse(&value(args, &mut index, "--maker")?)?;
+                maker = Some(if maker == Some(Maker::Human) || next == Maker::Human {
+                    Maker::Human
+                } else {
+                    Maker::Agent
+                });
+            }
+            "--supersedes" => set_once(
+                &mut supersedes,
+                value(args, &mut index, "--supersedes")?,
+                "--supersedes",
+            )?,
+            "--related" => related.push(value(args, &mut index, "--related")?),
+            "--store-dir" => {
+                let path = PathBuf::from(value(args, &mut index, "--store-dir")?);
+                set_once(&mut store_dir, path, "--store-dir")?;
+            }
+            other => return Err(format!("unknown add argument {other:?}")),
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::Add(DecisionDraft {
+            context: context.ok_or_else(|| "add requires --context".to_string())?,
+            choices,
+            decision: decision.ok_or_else(|| "add requires --decision".to_string())?,
+            maker: maker.ok_or_else(|| "add requires --maker".to_string())?,
+            supersedes,
+            related,
+        }),
+        store_dir,
+    })
+}
+
+fn parse_show(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::Show), &[]);
+    }
+    let mut id = None;
+    let mut json = false;
+    let mut store_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--store-dir" => {
+                let path = PathBuf::from(value(args, &mut index, "--store-dir")?);
+                set_once(&mut store_dir, path, "--store-dir")?;
+            }
+            other if !other.starts_with('-') => set_once(&mut id, other.to_string(), "ID")?,
+            other => return Err(format!("unknown show argument {other:?}")),
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::Show {
+            id: id.ok_or_else(|| "show requires an ID or prefix".to_string())?,
+            json,
+        },
+        store_dir,
+    })
+}
+
+#[derive(Debug, Default)]
+struct BrowseArgs {
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<usize>,
+    json: bool,
+    store_dir: Option<PathBuf>,
+}
+
+fn parse_list(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::List), &[]);
+    }
+    let mut browse = BrowseArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        if !parse_browse_option(args, &mut index, &mut browse)? {
+            return Err(format!("unknown list argument {:?}", args[index]));
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::List {
+            since: browse.since,
+            until: browse.until,
+            limit: browse.limit.unwrap_or(20),
+            json: browse.json,
+        },
+        store_dir: browse.store_dir,
+    })
+}
+
+fn parse_export(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::Export), &[]);
+    }
+    let mut output = None;
+    let mut browse = BrowseArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" => {
+                let path = PathBuf::from(value(args, &mut index, "--output")?);
+                set_once(&mut output, path, "--output")?;
+            }
+            "--json" => return Err("export writes HTML and does not accept --json".into()),
+            other => {
+                if !parse_browse_option(args, &mut index, &mut browse)? {
+                    return Err(format!("unknown export argument {other:?}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::Export {
+            output: output.ok_or_else(|| "export requires --output FILE".to_string())?,
+            since: browse.since,
+            until: browse.until,
+            limit: browse.limit,
+        },
+        store_dir: browse.store_dir,
+    })
+}
+
+fn parse_search(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::Search), &[]);
+    }
+    let mut query = None;
+    let mut field = None;
+    let mut pattern = None;
+    let mut browse = BrowseArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--field" => {
+                let parsed = SearchField::parse(&value(args, &mut index, "--field")?)?;
+                set_once(&mut field, parsed, "--field")?;
+            }
+            "--regex" => {
+                let raw = value(args, &mut index, "--regex")?;
+                if raw.len() > MAX_REGEX_BYTES {
+                    return Err(format!("--regex exceeds {MAX_REGEX_BYTES} UTF-8 bytes"));
+                }
+                set_once(&mut pattern, raw, "--regex")?;
+            }
+            "--" => {
+                for raw in &args[index + 1..] {
+                    set_once(&mut query, raw.clone(), "QUERY")?;
+                }
+                break;
+            }
+            other if !other.starts_with('-') => {
+                set_once(&mut query, other.to_string(), "QUERY")?;
+            }
+            other => {
+                if !parse_browse_option(args, &mut index, &mut browse)? {
+                    return Err(format!("unknown search argument {other:?}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    if let Some(raw) = &query {
+        if raw.is_empty() || raw.len() > MAX_REGEX_BYTES {
+            return Err(format!(
+                "QUERY must contain 1..{MAX_REGEX_BYTES} UTF-8 bytes"
+            ));
+        }
+        if field.is_some() || pattern.is_some() {
+            return Err("QUERY cannot be combined with --field or --regex".into());
+        }
+    }
+    if field.is_some() != pattern.is_some() {
+        return Err("search requires --field and --regex together".into());
+    }
+    if query.is_none() && field.is_none() && browse.since.is_none() && browse.until.is_none() {
+        return Err("search requires QUERY, --field with --regex, --since, or --until".into());
+    }
+    Ok(Config {
+        command: Command::Search {
+            field,
+            pattern: query.or(pattern),
+            since: browse.since,
+            until: browse.until,
+            limit: browse.limit.unwrap_or(20),
+            json: browse.json,
+        },
+        store_dir: browse.store_dir,
+    })
+}
+
+fn parse_browse_option(
+    args: &[String],
+    index: &mut usize,
+    browse: &mut BrowseArgs,
+) -> Result<bool, String> {
+    match args[*index].as_str() {
+        "--since" => {
+            let raw = value(args, index, "--since")?;
+            if raw.len() > MAX_TIME_BYTES {
+                return Err(format!("--since exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+            }
+            set_once(&mut browse.since, raw, "--since")?;
+        }
+        "--until" => {
+            let raw = value(args, index, "--until")?;
+            if raw.len() > MAX_TIME_BYTES {
+                return Err(format!("--until exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+            }
+            set_once(&mut browse.until, raw, "--until")?;
+        }
+        "--limit" => {
+            let raw = value(args, index, "--limit")?;
+            let limit = raw
+                .parse::<usize>()
+                .map_err(|_| "--limit must be an integer from 1 through 1000".to_string())?;
+            if !(1..=1_000).contains(&limit) {
+                return Err("--limit must be from 1 through 1000".into());
+            }
+            set_once(&mut browse.limit, limit, "--limit")?;
+        }
+        "--json" => browse.json = true,
+        "--store-dir" => {
+            let path = PathBuf::from(value(args, index, "--store-dir")?);
+            set_once(&mut browse.store_dir, path, "--store-dir")?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_forget(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::Forget), &[]);
+    }
+    let mut id = None;
+    let mut confirmed = false;
+    let mut store_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--yes" => confirmed = true,
+            "--store-dir" => {
+                let path = PathBuf::from(value(args, &mut index, "--store-dir")?);
+                set_once(&mut store_dir, path, "--store-dir")?;
+            }
+            other if !other.starts_with('-') => set_once(&mut id, other.to_string(), "ID")?,
+            other => return Err(format!("unknown forget argument {other:?}")),
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::Forget {
+            id: id.ok_or_else(|| "forget requires an exact ID".to_string())?,
+            confirmed,
+        },
+        store_dir,
+    })
+}
+
+fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, label: &str) -> Result<(), String> {
+    if slot.replace(value).is_some() {
+        return Err(format!("{label} may appear only once"));
+    }
+    Ok(())
+}
+
+fn wants_help(args: &[String]) -> bool {
+    matches!(args, [value] if value == "-h" || value == "--help")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn human_maker_overrides_agent() {
+        let config = parse_args(&args(&[
+            "add",
+            "--context",
+            "Choose storage",
+            "--choice",
+            "SQL",
+            "--choice",
+            "Files",
+            "--decision",
+            "2",
+            "--maker",
+            "human",
+            "--maker",
+            "agent",
+        ]))
+        .unwrap();
+        let Command::Add(draft) = config.command else {
+            panic!("expected add command");
+        };
+        assert_eq!(draft.choices.len(), 2);
+        assert_eq!(draft.decision, 2);
+        assert_eq!(draft.maker, Maker::Human);
+    }
+
+    #[test]
+    fn parses_immutable_relationships() {
+        let supersedes = "D-20260716-063012-a3f921c84d77e102";
+        let related = "D-20260715-063012-a3f921c84d77e102";
+        let config = parse_args(&args(&[
+            "add",
+            "--context",
+            "Choose storage",
+            "--choice",
+            "Files",
+            "--choice",
+            "Database",
+            "--decision",
+            "1",
+            "--maker",
+            "human",
+            "--supersedes",
+            supersedes,
+            "--related",
+            related,
+        ]))
+        .unwrap();
+        let Command::Add(draft) = config.command else {
+            panic!("expected add command");
+        };
+        assert_eq!(draft.supersedes.as_deref(), Some(supersedes));
+        assert_eq!(draft.related, vec![related]);
+    }
+
+    #[test]
+    fn browse_limits_accept_the_upper_boundary_and_reject_the_next_value() {
+        for command in ["list", "search", "export"] {
+            for (limit, accepted) in [("0", false), ("1", true), ("1000", true), ("1001", false)] {
+                let mut argv = vec![command, "--limit", limit];
+                match command {
+                    "search" => argv.push("needle"),
+                    "export" => argv.extend(["--output", "out.html"]),
+                    _ => {}
+                }
+                let result = parse_args(&args(&argv));
+                assert_eq!(result.is_ok(), accepted, "{argv:?}: {result:?}");
+                if let Err(error) = result {
+                    assert!(error.contains("1000"), "{argv:?}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parses_list_defaults_and_bounds() {
+        let config = parse_args(&args(&["list"])).unwrap();
+        let Command::List {
+            since,
+            until,
+            limit,
+            json,
+        } = config.command
+        else {
+            panic!("expected list command");
+        };
+        assert!(since.is_none());
+        assert!(until.is_none());
+        assert_eq!(limit, 20);
+        assert!(!json);
+
+        let config = parse_args(&args(&[
+            "list", "--since", "7d", "--until", "now", "--limit", "5", "--json",
+        ]))
+        .unwrap();
+        let Command::List {
+            since,
+            until,
+            limit,
+            json,
+        } = config.command
+        else {
+            panic!("expected list command");
+        };
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(until.as_deref(), Some("now"));
+        assert_eq!(limit, 5);
+        assert!(json);
+    }
+
+    #[test]
+    fn list_rejects_search_filters() {
+        let error = parse_args(&args(&["list", "--field", "context"])).unwrap_err();
+        assert!(error.contains("unknown list argument"));
+    }
+
+    #[test]
+    fn parses_export_defaults_and_bounds() {
+        let config = parse_args(&args(&["export", "--output", "decisions.html"])).unwrap();
+        let Command::Export {
+            output,
+            since,
+            until,
+            limit,
+        } = config.command
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(output, PathBuf::from("decisions.html"));
+        assert!(since.is_none());
+        assert!(until.is_none());
+        assert!(limit.is_none());
+
+        let config = parse_args(&args(&[
+            "export",
+            "--output",
+            "recent.html",
+            "--since",
+            "7d",
+            "--until",
+            "now",
+            "--limit",
+            "5",
+        ]))
+        .unwrap();
+        let Command::Export {
+            output,
+            since,
+            until,
+            limit,
+        } = config.command
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(output, PathBuf::from("recent.html"));
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(until.as_deref(), Some("now"));
+        assert_eq!(limit, Some(5));
+    }
+
+    #[test]
+    fn export_requires_output_and_rejects_json() {
+        let error = parse_args(&args(&["export"])).unwrap_err();
+        assert!(error.contains("requires --output"));
+        let error = parse_args(&args(&["export", "--output", "x.html", "--json"])).unwrap_err();
+        assert!(error.contains("does not accept --json"));
+    }
+
+    #[test]
+    fn parses_time_only_search() {
+        let config = parse_args(&args(&[
+            "search", "--since", "7d", "--until", "now", "--limit", "5",
+        ]))
+        .unwrap();
+        let Command::Search {
+            field,
+            pattern,
+            since,
+            until,
+            limit,
+            ..
+        } = config.command
+        else {
+            panic!("expected search command");
+        };
+        assert!(field.is_none());
+        assert!(pattern.is_none());
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(until.as_deref(), Some("now"));
+        assert_eq!(limit, 5);
+    }
+
+    #[test]
+    fn literal_search_accepts_filters_and_dash_prefixed_query() {
+        for (argv, expected) in [
+            (
+                vec!["search", "Cache[1]", "--since", "7d", "--limit", "5"],
+                "Cache[1]",
+            ),
+            (
+                vec!["search", "--since", "7d", "--limit", "5", "--", "--help"],
+                "--help",
+            ),
+        ] {
+            let config = parse_args(&args(&argv)).unwrap();
+            let Command::Search {
+                field,
+                pattern,
+                since,
+                limit,
+                ..
+            } = config.command
+            else {
+                panic!("expected search command");
+            };
+            assert!(field.is_none());
+            assert_eq!(pattern.as_deref(), Some(expected));
+            assert_eq!(since.as_deref(), Some("7d"));
+            assert_eq!(limit, 5);
+        }
+    }
+
+    #[test]
+    fn literal_search_rejects_ambiguous_or_invalid_input() {
+        for argv in [
+            vec!["search", ""],
+            vec!["search", "one", "two"],
+            vec!["search", "one", "--", "two"],
+            vec!["search", "one", "--field", "context"],
+            vec!["search", "one", "--regex", "x"],
+            vec!["search", "one", "--field", "context", "--regex", "x"],
+            vec!["search", "--unknown"],
+        ] {
+            assert!(parse_args(&args(&argv)).is_err(), "{argv:?}");
+        }
+        assert!(parse_args(&["search".into(), "a".repeat(MAX_REGEX_BYTES + 1)]).is_err());
+    }
+
+    #[test]
+    fn search_requires_field_and_regex_together() {
+        let error =
+            parse_args(&args(&["search", "--field", "context", "--since", "7d"])).unwrap_err();
+        assert!(error.contains("--field and --regex together"));
+    }
+
+    #[test]
+    fn search_requires_at_least_one_filter() {
+        let error = parse_args(&args(&["search", "--limit", "5"])).unwrap_err();
+        assert!(error.contains("--since, or --until"));
+    }
+
+    #[test]
+    fn rejects_oversized_search_time() {
+        let oversized = "1".repeat(MAX_TIME_BYTES + 1);
+        let error = parse_args(&["search".into(), "--since".into(), oversized]).unwrap_err();
+        assert!(error.contains("--since exceeds"));
+    }
+
+    #[test]
+    fn subcommand_help_selects_specific_topic() {
+        let config = parse_args(&args(&["search", "--help"])).expect("parse help");
+        assert!(matches!(config.command, Command::Help(HelpTopic::Search)));
+        assert!(
+            HelpTopic::Search
+                .text()
+                .contains("Selected choice text only")
+        );
+
+        let config = parse_args(&args(&["help", "add"])).expect("parse help alias");
+        assert!(matches!(config.command, Command::Help(HelpTopic::Add)));
+
+        let config = parse_args(&args(&["list", "--help"])).expect("parse list help");
+        assert!(matches!(config.command, Command::Help(HelpTopic::List)));
+
+        let config = parse_args(&args(&["help", "export"])).expect("parse export help");
+        assert!(matches!(config.command, Command::Help(HelpTopic::Export)));
+    }
+}

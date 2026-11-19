@@ -1,0 +1,1053 @@
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use crate::language::Language;
+use crate::model::{Symbol, SymbolPath};
+use crate::util::{one_line, percent_decode, sanitize_metadata};
+
+const MAX_SYMBOLS: usize = 100_000;
+const MAX_LOCATIONS: usize = 100_000;
+const MAX_SYMBOL_DEPTH: usize = 128;
+const MAX_URI_BYTES: usize = 16 * 1024;
+const MAX_HOVER_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_CALL_ITEMS: usize = 1_024;
+pub(super) const MAX_CALL_RANGES: usize = 100_000;
+pub(super) const MAX_TYPE_ITEMS: usize = 1_024;
+
+#[derive(Clone, Copy, Debug)]
+pub enum PositionEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
+impl PositionEncoding {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Utf16 => "utf-16",
+            Self::Utf32 => "utf-32",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LspPosition {
+    pub line: usize,
+    pub character: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LspRange {
+    pub start: LspPosition,
+    pub end: LspPosition,
+}
+
+#[derive(Clone, Debug)]
+pub struct LspLocation {
+    pub uri: String,
+    pub range: LspRange,
+    pub encoding: PositionEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HoverFormat {
+    PlainText,
+    Markdown,
+}
+
+impl HoverFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlainText => "plaintext",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LspHover {
+    pub contents: String,
+    pub format: HoverFormat,
+    pub range: Option<LspRange>,
+    pub encoding: PositionEncoding,
+}
+
+#[derive(Clone, Debug)]
+pub struct LspCall {
+    pub name: String,
+    pub kind: &'static str,
+    pub uri: String,
+    pub range: LspRange,
+    pub site_uri: String,
+    pub call_ranges: Vec<LspRange>,
+    pub encoding: PositionEncoding,
+}
+
+#[derive(Clone, Debug)]
+pub struct LspTypeItem {
+    pub name: String,
+    pub kind: &'static str,
+    pub uri: String,
+    pub range: LspRange,
+    pub selection_range: LspRange,
+    pub encoding: PositionEncoding,
+}
+
+pub fn file_path_from_uri(uri: &str) -> Result<Option<PathBuf>, String> {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    let path = if let Some(path) = rest.strip_prefix('/') {
+        format!("/{path}")
+    } else if let Some(path) = rest.strip_prefix("localhost/") {
+        format!("/{path}")
+    } else {
+        return Ok(None);
+    };
+    let mut decoded =
+        percent_decode(&path).map_err(|error| format!("invalid file URI: {error}"))?;
+    if decoded.contains('\0') {
+        return Err("file URI contains a null byte".into());
+    }
+    // Do not hand remote/device forms to metadata, canonicalize, or open. Keep
+    // them as URI locations, including encoded separator/authority variants.
+    if !local_uri_path(&decoded, cfg!(windows)) {
+        return Ok(None);
+    }
+    if cfg!(windows) && decoded.starts_with('/') && decoded.as_bytes().get(2) == Some(&b':') {
+        decoded.remove(0);
+    }
+    Ok(Some(PathBuf::from(decoded)))
+}
+
+fn local_uri_path(path: &str, windows: bool) -> bool {
+    if path.starts_with("//") || path.starts_with("/\\") {
+        return false;
+    }
+    if !windows {
+        return true;
+    }
+    if path.contains('\\') {
+        return false;
+    }
+    !path.split('/').enumerate().any(|(index, part)| {
+        let base = part
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        (part.contains(':')
+            && !(index == 1 && part.len() == 2 && part.as_bytes()[0].is_ascii_alphabetic()))
+            || matches!(
+                base.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || (["COM", "LPT"].iter().any(|prefix| {
+                base.strip_prefix(prefix).is_some_and(|suffix| {
+                    matches!(
+                        suffix,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+            }))
+    })
+}
+
+pub fn normalize_range(
+    source: &str,
+    range: LspRange,
+    encoding: PositionEncoding,
+) -> Result<LspRange, String> {
+    let positions = SourcePositions::new(source, encoding);
+    let (_, start_line, start_column) = positions.protocol_position(range.start)?;
+    let (_, end_line, end_column) = positions.protocol_position(range.end)?;
+    Ok(LspRange {
+        start: LspPosition {
+            line: start_line,
+            character: start_column,
+        },
+        end: LspPosition {
+            line: end_line,
+            character: end_column,
+        },
+    })
+}
+
+pub(super) fn parse_locations(
+    value: &Value,
+    allow_links: bool,
+    encoding: PositionEncoding,
+) -> Result<Vec<LspLocation>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    if let Some(values) = value.as_array() {
+        if values.len() > MAX_LOCATIONS {
+            return Err("LSP location result exceeds the structural safety limit".into());
+        }
+        let mut locations = Vec::with_capacity(values.len());
+        for value in values {
+            locations.push(parse_location(value, allow_links, encoding)?);
+        }
+        return Ok(locations);
+    }
+    value
+        .is_object()
+        .then(|| parse_location(value, allow_links, encoding))
+        .ok_or_else(|| "LSP location result is not an object, array, or null".to_string())?
+        .map(|location| vec![location])
+}
+
+pub(super) fn parse_call_items(value: &Value) -> Result<Vec<Value>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| "LSP prepare-call-hierarchy result is not an array or null".to_string())?;
+    if values.len() > MAX_CALL_ITEMS {
+        return Err("LSP call hierarchy preparation exceeds the safety limit".into());
+    }
+    for item in values {
+        validate_call_item(item)?;
+    }
+    Ok(values.clone())
+}
+
+pub(super) fn parse_type_items(value: &Value) -> Result<Vec<Value>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| "LSP type hierarchy result is not an array or null".to_string())?;
+    if values.len() > MAX_TYPE_ITEMS {
+        return Err("LSP type hierarchy result exceeds the safety limit".into());
+    }
+    for item in values {
+        validate_type_item(item)?;
+    }
+    Ok(values.clone())
+}
+
+pub(super) fn parse_type_relations(
+    value: &Value,
+    encoding: PositionEncoding,
+) -> Result<Vec<LspTypeItem>, String> {
+    parse_type_items(value)?
+        .into_iter()
+        .map(|item| {
+            let (name, kind, uri, range, selection_range) = validate_type_item(&item)?;
+            Ok(LspTypeItem {
+                name,
+                kind,
+                uri,
+                range,
+                selection_range,
+                encoding,
+            })
+        })
+        .collect()
+}
+
+fn validate_type_item(
+    value: &Value,
+) -> Result<(String, &'static str, String, LspRange, LspRange), String> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| bounded_text(name, 1024))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "LSP type hierarchy item has no usable name".to_string())?;
+    let kind = symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0));
+    let uri = required(value, "uri")?
+        .as_str()
+        .ok_or_else(|| "LSP type hierarchy item URI is not a string".to_string())?;
+    if uri.len() > MAX_URI_BYTES {
+        return Err("LSP type hierarchy item URI exceeds the safety limit".into());
+    }
+    let range = parse_protocol_range(required(value, "range")?)?;
+    let selection_range = parse_protocol_range(required(value, "selectionRange")?)?;
+    Ok((name, kind, uri.to_string(), range, selection_range))
+}
+
+pub(super) fn parse_calls(
+    value: &Value,
+    incoming: bool,
+    source_uri: &str,
+    encoding: PositionEncoding,
+) -> Result<Vec<LspCall>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| "LSP call hierarchy result is not an array or null".to_string())?;
+    if values.len() > MAX_CALL_ITEMS {
+        return Err("LSP call hierarchy result exceeds the safety limit".into());
+    }
+    let item_key = if incoming { "from" } else { "to" };
+    let mut calls = Vec::with_capacity(values.len());
+    let mut total_ranges = 0usize;
+    for relation in values {
+        let item = required(relation, item_key)?;
+        let (name, kind, uri, range) = validate_call_item(item)?;
+        let ranges = required(relation, "fromRanges")?
+            .as_array()
+            .ok_or_else(|| "LSP call hierarchy fromRanges is not an array".to_string())?;
+        total_ranges = total_ranges.saturating_add(ranges.len());
+        if total_ranges > MAX_CALL_RANGES {
+            return Err("LSP call hierarchy ranges exceed the safety limit".into());
+        }
+        let call_ranges = ranges
+            .iter()
+            .map(parse_protocol_range)
+            .collect::<Result<Vec<_>, _>>()?;
+        calls.push(LspCall {
+            name,
+            kind,
+            site_uri: if incoming {
+                uri.clone()
+            } else {
+                source_uri.to_string()
+            },
+            uri,
+            range,
+            call_ranges,
+            encoding,
+        });
+    }
+    Ok(calls)
+}
+
+fn validate_call_item(value: &Value) -> Result<(String, &'static str, String, LspRange), String> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| bounded_text(name, 1024))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "LSP call hierarchy item has no usable name".to_string())?;
+    let kind = symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0));
+    let uri = required(value, "uri")?
+        .as_str()
+        .ok_or_else(|| "LSP call hierarchy item URI is not a string".to_string())?;
+    if uri.len() > MAX_URI_BYTES {
+        return Err("LSP call hierarchy item URI exceeds the safety limit".into());
+    }
+    let range = value
+        .get("selectionRange")
+        .or_else(|| value.get("range"))
+        .ok_or_else(|| "LSP call hierarchy item omitted its range".to_string())?;
+    Ok((name, kind, uri.to_string(), parse_protocol_range(range)?))
+}
+
+fn parse_location(
+    value: &Value,
+    allow_links: bool,
+    encoding: PositionEncoding,
+) -> Result<LspLocation, String> {
+    let (uri, range) = if let Some(uri) = value.get("uri") {
+        (uri, required(value, "range")?)
+    } else if allow_links {
+        (
+            required(value, "targetUri")?,
+            value
+                .get("targetSelectionRange")
+                .or_else(|| value.get("targetRange"))
+                .ok_or_else(|| "LSP location link omitted its target range".to_string())?,
+        )
+    } else {
+        return Err("LSP reference is not a location".into());
+    };
+    let uri = uri
+        .as_str()
+        .ok_or_else(|| "LSP location URI is not a string".to_string())?;
+    if uri.len() > MAX_URI_BYTES {
+        return Err("LSP location URI exceeds the safety limit".into());
+    }
+    Ok(LspLocation {
+        uri: uri.to_string(),
+        range: parse_protocol_range(range)?,
+        encoding,
+    })
+}
+
+fn parse_protocol_range(value: &Value) -> Result<LspRange, String> {
+    let start = parse_protocol_position(required(value, "start")?)?;
+    let end = parse_protocol_position(required(value, "end")?)?;
+    if (end.line, end.character) < (start.line, start.character) {
+        return Err("LSP range is reversed".into());
+    }
+    Ok(LspRange { start, end })
+}
+
+fn parse_protocol_position(value: &Value) -> Result<LspPosition, String> {
+    let line = required(value, "line")?
+        .as_u64()
+        .filter(|value| *value <= i32::MAX as u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "LSP position line is not a valid integer".to_string())?;
+    let character = required(value, "character")?
+        .as_u64()
+        .filter(|value| *value <= i32::MAX as u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "LSP position character is not a valid integer".to_string())?;
+    Ok(LspPosition { line, character })
+}
+
+pub(super) fn parse_hover(
+    value: &Value,
+    encoding: PositionEncoding,
+) -> Result<Option<LspHover>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "LSP hover result is not an object or null".to_string())?;
+    let (contents, format) = parse_hover_contents(
+        object
+            .get("contents")
+            .ok_or_else(|| "LSP hover result omitted contents".to_string())?,
+    )?;
+    if contents.len() > MAX_HOVER_BYTES {
+        return Err("LSP hover contents exceed the 1 MiB safety limit".into());
+    }
+    let range = object.get("range").map(parse_protocol_range).transpose()?;
+    Ok(Some(LspHover {
+        contents,
+        format,
+        range,
+        encoding,
+    }))
+}
+
+fn parse_hover_contents(value: &Value) -> Result<(String, HoverFormat), String> {
+    if let Some(text) = value.as_str() {
+        return Ok((text.to_string(), HoverFormat::Markdown));
+    }
+    if let Some(values) = value.as_array() {
+        let mut parts = Vec::with_capacity(values.len());
+        let mut format = HoverFormat::PlainText;
+        for value in values {
+            let (part, part_format) = parse_hover_contents(value)?;
+            if part_format == HoverFormat::Markdown {
+                format = HoverFormat::Markdown;
+            }
+            parts.push(part);
+        }
+        return Ok((parts.join("\n\n"), format));
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "LSP hover contents have an unsupported shape".to_string())?;
+    let text = object
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "LSP hover content object omitted string value".to_string())?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("plaintext") => Ok((text.to_string(), HoverFormat::PlainText)),
+        Some("markdown") => Ok((text.to_string(), HoverFormat::Markdown)),
+        Some(other) => Err(format!(
+            "unsupported LSP hover markup kind: {}",
+            bounded_text(other, 128)
+        )),
+        None => {
+            let language = object
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let language = one_line(&bounded_text(language, 64)).replace('`', "");
+            Ok((format!("```{language}\n{text}\n```"), HoverFormat::Markdown))
+        }
+    }
+}
+
+pub(super) fn parse_document_symbols(
+    value: &Value,
+    uri: &str,
+    source: &str,
+    language: Language,
+    encoding: PositionEncoding,
+) -> Result<Vec<Symbol>, String> {
+    let Some(entries) = value.as_array() else {
+        return value
+            .is_null()
+            .then(Vec::new)
+            .ok_or_else(|| "LSP document symbols result is not an array or null".into());
+    };
+    let positions = SourcePositions::new(source, encoding);
+    let mut symbols = Vec::new();
+    for entry in entries {
+        if entry.get("location").is_some() {
+            push_flat_symbol(entry, uri, language, &positions, &mut symbols)?;
+        } else {
+            push_document_symbol(entry, None, 0, 0, language, &positions, &mut symbols)?;
+        }
+    }
+    symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.depth));
+    symbols.dedup_by(|left, right| {
+        left.start_byte == right.start_byte
+            && left.end_byte == right.end_byte
+            && left.kind == right.kind
+            && left.qualified_name == right.qualified_name
+    });
+    Ok(symbols)
+}
+
+fn push_document_symbol(
+    value: &Value,
+    parent: Option<&LspScope>,
+    depth: usize,
+    nesting: usize,
+    language: Language,
+    positions: &SourcePositions<'_>,
+    output: &mut Vec<Symbol>,
+) -> Result<(), String> {
+    if nesting > MAX_SYMBOL_DEPTH || output.len() >= MAX_SYMBOLS {
+        return Err("LSP document symbols exceed structural safety limits".into());
+    }
+    let name = symbol_name(value)?;
+    if language == Language::Lean && name == "<section>" {
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                push_document_symbol(
+                    child,
+                    parent,
+                    depth,
+                    nesting + 1,
+                    language,
+                    positions,
+                    output,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    let qualified = qualify_lsp(parent, &name, language);
+    let (start_byte, end_byte, start_row, start_column, end_row, end_column) =
+        positions.range(required(value, "range")?)?;
+    let name_position = value
+        .get("selectionRange")
+        .map(|selection| {
+            let (selected_start, selected_end, row, column, _, _) = positions.range(selection)?;
+            if selected_start < start_byte || selected_end > end_byte {
+                return Err("LSP symbol selectionRange is outside its range".to_string());
+            }
+            Ok((row, column))
+        })
+        .transpose()?;
+    output.push(Symbol {
+        kind: symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0)),
+        path: qualified.path.clone(),
+        qualified_name: qualified.path.canonical(),
+        legacy_qualified_name: qualified.legacy.clone(),
+        name_position,
+        signature: bounded_text(
+            value.get("detail").and_then(Value::as_str).unwrap_or(&name),
+            4 * 1024,
+        ),
+        start_byte,
+        end_byte,
+        start_row,
+        start_column,
+        end_row,
+        end_column,
+        depth,
+    });
+    if let Some(children) = value.get("children").and_then(Value::as_array) {
+        for child in children {
+            push_document_symbol(
+                child,
+                Some(&qualified),
+                depth + 1,
+                nesting + 1,
+                language,
+                positions,
+                output,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn push_flat_symbol(
+    value: &Value,
+    uri: &str,
+    language: Language,
+    positions: &SourcePositions<'_>,
+    output: &mut Vec<Symbol>,
+) -> Result<(), String> {
+    if output.len() >= MAX_SYMBOLS {
+        return Err("LSP document symbols exceed structural safety limits".into());
+    }
+    let location = required(value, "location")?;
+    if location.get("uri").and_then(Value::as_str) != Some(uri) {
+        return Ok(());
+    }
+    let name = symbol_name(value)?;
+    let container = value.get("containerName").and_then(Value::as_str);
+    let container = container.map(|name| qualify_lsp(None, name, language));
+    let qualified = qualify_lsp(container.as_ref(), &name, language);
+    let (start_byte, end_byte, start_row, start_column, end_row, end_column) =
+        positions.range(required(location, "range")?)?;
+    output.push(Symbol {
+        kind: symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0)),
+        path: qualified.path.clone(),
+        qualified_name: qualified.path.canonical(),
+        legacy_qualified_name: qualified.legacy,
+        name_position: None,
+        signature: bounded_text(&name, 4 * 1024),
+        start_byte,
+        end_byte,
+        start_row,
+        start_column,
+        end_row,
+        end_column,
+        depth: 0,
+    });
+    Ok(())
+}
+
+pub(super) struct SourcePositions<'a> {
+    source: &'a str,
+    line_starts: Cow<'a, [usize]>,
+    encoding: PositionEncoding,
+}
+
+impl<'a> SourcePositions<'a> {
+    pub(super) fn new(source: &'a str, encoding: PositionEncoding) -> Self {
+        Self {
+            source,
+            line_starts: Cow::Owned(Self::index(source)),
+            encoding,
+        }
+    }
+
+    pub(super) fn with_index(
+        source: &'a str,
+        encoding: PositionEncoding,
+        line_starts: &'a [usize],
+    ) -> Self {
+        Self {
+            source,
+            line_starts: Cow::Borrowed(line_starts),
+            encoding,
+        }
+    }
+
+    pub(super) fn index(source: &str) -> Vec<usize> {
+        let mut line_starts = vec![0];
+        for (index, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                line_starts.push(index + 1);
+            }
+        }
+        line_starts
+    }
+
+    fn range(&self, value: &Value) -> Result<(usize, usize, usize, usize, usize, usize), String> {
+        let (start_byte, start_row, start_column) = self.position(required(value, "start")?)?;
+        let (end_byte, end_row, end_column) = self.position(required(value, "end")?)?;
+        if end_byte <= start_byte {
+            return Err("LSP symbol has an empty or reversed range".into());
+        }
+        Ok((
+            start_byte,
+            end_byte,
+            start_row,
+            start_column,
+            end_row,
+            end_column,
+        ))
+    }
+
+    fn position(&self, value: &Value) -> Result<(usize, usize, usize), String> {
+        self.protocol_position(parse_protocol_position(value)?)
+    }
+
+    fn protocol_position(&self, value: LspPosition) -> Result<(usize, usize, usize), String> {
+        let row = value.line;
+        let units = value.character;
+        let start = *self
+            .line_starts
+            .get(row)
+            .ok_or_else(|| format!("LSP position line {} is outside the source", row + 1))?;
+        let mut end = self
+            .line_starts
+            .get(row + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        if end > start && self.source.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+            if end > start && self.source.as_bytes()[end - 1] == b'\r' {
+                end -= 1;
+            }
+        }
+        let line = &self.source[start..end];
+        let byte_column = match self.encoding {
+            PositionEncoding::Utf8 => {
+                if units > line.len() || !line.is_char_boundary(units) {
+                    return Err("LSP UTF-8 position splits or exceeds a source character".into());
+                }
+                units
+            }
+            PositionEncoding::Utf16 => encoded_column(line, units, char::len_utf16)?,
+            PositionEncoding::Utf32 => encoded_column(line, units, |_| 1)?,
+        };
+        Ok((start + byte_column, row, byte_column))
+    }
+
+    pub(super) fn lsp_position(
+        &self,
+        row: usize,
+        byte_column: usize,
+    ) -> Result<LspPosition, String> {
+        let start = *self
+            .line_starts
+            .get(row)
+            .ok_or_else(|| format!("source line {} is outside the file", row + 1))?;
+        let mut end = self
+            .line_starts
+            .get(row + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        if end > start && self.source.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+            if end > start && self.source.as_bytes()[end - 1] == b'\r' {
+                end -= 1;
+            }
+        }
+        let line = &self.source[start..end];
+        if byte_column > line.len() || !line.is_char_boundary(byte_column) {
+            return Err(format!(
+                "source column {} splits or exceeds a character on line {}",
+                byte_column + 1,
+                row + 1
+            ));
+        }
+        let prefix = &line[..byte_column];
+        let character = match self.encoding {
+            PositionEncoding::Utf8 => byte_column,
+            PositionEncoding::Utf16 => prefix.encode_utf16().count(),
+            PositionEncoding::Utf32 => prefix.chars().count(),
+        };
+        Ok(LspPosition {
+            line: row,
+            character,
+        })
+    }
+}
+
+fn encoded_column(
+    line: &str,
+    requested: usize,
+    width: impl Fn(char) -> usize,
+) -> Result<usize, String> {
+    let mut units = 0usize;
+    for (byte, character) in line.char_indices() {
+        if units == requested {
+            return Ok(byte);
+        }
+        units += width(character);
+        if units > requested {
+            return Err("LSP position splits a multi-unit source character".into());
+        }
+    }
+    if units == requested {
+        Ok(line.len())
+    } else {
+        Err("LSP position exceeds its source line".into())
+    }
+}
+
+fn required<'a>(value: &'a Value, key: &str) -> Result<&'a Value, String> {
+    value
+        .get(key)
+        .ok_or_else(|| format!("LSP document symbol omitted {key}"))
+}
+
+fn symbol_name(value: &Value) -> Result<String, String> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| bounded_text(name, 1024))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "LSP document symbol has no usable name".to_string())?;
+    Ok(name)
+}
+
+pub(super) fn bounded_text(value: &str, max_bytes: usize) -> String {
+    let mut text = one_line(&sanitize_metadata(value));
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
+struct LspScope {
+    path: SymbolPath,
+    legacy: String,
+}
+
+fn qualify_lsp(parent: Option<&LspScope>, name: &str, language: Language) -> LspScope {
+    let separator = qualification_separator(language);
+    let split = |value: &str| {
+        value
+            .split(separator)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let Some(parent) = parent.filter(|parent| !parent.legacy.is_empty()) else {
+        return LspScope {
+            path: SymbolPath::from_names(split(name)),
+            legacy: name.to_owned(),
+        };
+    };
+    if name == parent.legacy
+        || name
+            .strip_prefix(&parent.legacy)
+            .is_some_and(|suffix| suffix.starts_with(['.', ':', '\\']))
+    {
+        return LspScope {
+            path: SymbolPath::from_names(split(name)),
+            legacy: name.to_owned(),
+        };
+    }
+    LspScope {
+        path: parent.path.extend_names(split(name)),
+        legacy: format!("{}{separator}{name}", parent.legacy),
+    }
+}
+
+fn qualification_separator(language: Language) -> &'static str {
+    match language {
+        Language::Rust | Language::C | Language::Cpp | Language::Cuda | Language::PowerShell => {
+            "::"
+        }
+        Language::Php => "\\",
+        _ => ".",
+    }
+}
+
+pub(super) fn symbol_kind(kind: u64) -> &'static str {
+    match kind {
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "binding",
+        14 => "constant",
+        22 => "variant",
+        23 => "struct",
+        25 => "operator",
+        26 => "type",
+        _ => "symbol",
+    }
+}
+
+pub(super) fn language_id(language: Language) -> &'static str {
+    match language {
+        Language::Bash => "shellscript",
+        Language::Cuda => "cuda-cpp",
+        Language::Hcl => "terraform",
+        Language::Lean => "lean4",
+        _ => language.name(),
+    }
+}
+
+pub(super) fn file_uri(path: &Path) -> Result<String, String> {
+    let path = crate::util::local_disk_path(path);
+    let mut path = path
+        .to_str()
+        .ok_or_else(|| format!("LSP path is not valid UTF-8: {}", path.display()))?
+        .to_owned();
+    #[cfg(windows)]
+    {
+        path = path.replace('\\', "/");
+    }
+    if cfg!(windows) && !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    let mut uri = String::with_capacity(path.len() + 8);
+    uri.push_str("file://");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    Ok(uri)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PositionEncoding, SourcePositions, file_uri, parse_document_symbols};
+    use crate::language::Language;
+
+    #[test]
+    fn windows_uri_validation_rejects_unc_devices_streams_and_drive_relative_forms() {
+        for path in [
+            "//host/share/x",
+            "//?/C:/x",
+            "/?/C:/x",
+            "/C:/NUL.txt",
+            "/C:/COM¹",
+            "/C:/file:stream",
+            "/C:relative",
+            "/C:/back\\slash",
+        ] {
+            assert!(!super::local_uri_path(path, true), "{path}");
+        }
+        assert!(super::local_uri_path("/C:/local/file.rs", true));
+        assert!(super::local_uri_path("/tmp/literal\\name.rs", false));
+    }
+
+    #[test]
+    fn remote_and_device_uri_forms_remain_unopened_uri_locations() {
+        for uri in [
+            "file://host/share/x",
+            "file:////host/share/x",
+            "file:///%2fhost/share/x",
+            "file:///%5chost/share/x",
+            "file:////?/C:/x",
+            "file:////./pipe/x",
+        ] {
+            assert_eq!(super::file_path_from_uri(uri).unwrap(), None, "{uri}");
+        }
+        assert_eq!(
+            super::file_path_from_uri("file:///tmp/local.rs").unwrap(),
+            Some(std::path::PathBuf::from("/tmp/local.rs"))
+        );
+    }
+
+    #[test]
+    fn protocol_positions_reject_out_of_domain_integers() {
+        for field in ["line", "character"] {
+            for number in [
+                serde_json::json!(-1),
+                serde_json::json!(2147483648u64),
+                serde_json::json!(u64::MAX),
+            ] {
+                let mut point = serde_json::json!({"line":0,"character":0});
+                point[field] = number;
+                assert!(
+                    super::parse_protocol_position(&point)
+                        .unwrap_err()
+                        .contains("valid integer")
+                );
+                assert!(
+                    super::SourcePositions::new("x", super::PositionEncoding::Utf8)
+                        .position(&point)
+                        .unwrap_err()
+                        .contains("valid integer")
+                );
+            }
+        }
+        for number in [0, i32::MAX] {
+            let point = serde_json::json!({"line":number,"character":number});
+            assert!(super::parse_protocol_position(&point).is_ok());
+        }
+    }
+
+    #[test]
+    fn utf16_positions_map_to_utf8_byte_columns() {
+        let source = "aé😀z\n";
+        let positions = SourcePositions::new(source, PositionEncoding::Utf16);
+        let value = serde_json::json!({"line": 0, "character": 4});
+        assert_eq!(positions.position(&value).unwrap(), (7, 0, 7));
+    }
+
+    #[test]
+    fn positions_exclude_crlf_line_endings() {
+        let positions = SourcePositions::new("a\r\nb", PositionEncoding::Utf16);
+        let end = serde_json::json!({"line": 0, "character": 1});
+        let past_end = serde_json::json!({"line": 0, "character": 2});
+        assert_eq!(positions.position(&end).unwrap(), (1, 0, 1));
+        assert!(positions.position(&past_end).is_err());
+    }
+
+    #[test]
+    fn file_uri_escapes_spaces_and_unicode() {
+        let uri = file_uri(std::path::Path::new("/tmp/naïve file.rs")).unwrap();
+        assert_eq!(uri, "file:///tmp/na%C3%AFve%20file.rs");
+    }
+
+    #[test]
+    fn symbol_name_positions_use_validated_selection_ranges() {
+        let source = "/*é*/ fn f() {}\n";
+        let mut value = serde_json::json!([{
+            "name": "f", "kind": 12,
+            "range": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 14}},
+            "selectionRange": {"start": {"line": 0, "character": 9}, "end": {"line": 0, "character": 10}}
+        }]);
+        let parse = |v: &serde_json::Value| {
+            parse_document_symbols(
+                v,
+                "file:///tmp/name.rs",
+                source,
+                Language::Rust,
+                PositionEncoding::Utf16,
+            )
+        };
+        assert_eq!(parse(&value).unwrap()[0].name_position, Some((0, 10)));
+        value[0]["selectionRange"]["start"]["character"] = serde_json::json!(0);
+        assert!(parse(&value).err().unwrap().contains("outside its range"));
+        value[0].as_object_mut().unwrap().remove("selectionRange");
+        assert_eq!(parse(&value).unwrap()[0].name_position, None);
+    }
+
+    #[test]
+    fn lean_lsp_sections_are_transparent_navigation_scopes() {
+        let source = "namespace Algebraic\ntheorem foo : True := by trivial\nend Algebraic\n";
+        let result = serde_json::json!([{
+            "name": "<section>",
+            "kind": 3,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 13}},
+            "children": [{
+                "name": "Algebraic",
+                "kind": 3,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 13}},
+                "children": [{
+                    "name": "foo",
+                    "kind": 6,
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 31}}
+                }]
+            }]
+        }]);
+        let symbols = parse_document_symbols(
+            &result,
+            "file:///tmp/Test.lean",
+            source,
+            Language::Lean,
+            PositionEncoding::Utf16,
+        )
+        .unwrap();
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| (symbol.qualified_name.as_str(), symbol.depth))
+                .collect::<Vec<_>>(),
+            vec![("Algebraic", 0), ("Algebraic::foo", 1)]
+        );
+    }
+}

@@ -1,0 +1,281 @@
+//! Native CLI adaptation boundary. Shared ownership, supervision and artifacts stay
+//! outside this module; protocol loops remain native rather than emulating Codex.
+//! Add a harness here, its native launch/caller adapter, and its protocol loop.
+pub(crate) mod claude;
+pub(crate) mod codex;
+
+use crate::{Options, authentication, runtime};
+use serde_json::Value;
+use std::{path::Path, process::Command};
+
+// Launcher-first worker shell PATH is shared by both native adapters.
+fn worker_path(launcher: &Path, inherited: Option<&std::ffi::OsStr>) -> Result<String, String> {
+    let directory = launcher.parent().ok_or("Team launcher has no directory")?;
+    let mut paths = vec![directory.to_path_buf()];
+    if let Some(inherited) = inherited {
+        paths.extend(std::env::split_paths(inherited).filter(|path| path != directory));
+    }
+    std::env::join_paths(paths)
+        .map_err(|_| "cannot represent Team launcher directory in worker PATH")?
+        .into_string()
+        .map_err(|_| "worker PATH must be UTF-8 for native shell configuration".into())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PolicyDelivery {
+    RetainedPrefix,
+    ReplaceEachTurn,
+}
+
+pub(crate) struct Launch {
+    pub command: Command,
+    pub request_schema: Option<jsonschema::Validator>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Harness {
+    Codex,
+    Claude,
+}
+
+impl Harness {
+    pub(crate) const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+
+    pub(crate) fn inherits_native_profile(self) -> bool {
+        match self {
+            Self::Codex => false,
+            Self::Claude => true,
+        }
+    }
+
+    pub(crate) fn from_transport(transport: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|h| h.transport() == transport)
+    }
+
+    pub(crate) fn caller_identity(self, session: &str) -> String {
+        match self {
+            Self::Codex => session.to_owned(), // Retain published Codex owner IDs.
+            Self::Claude => format!("claude-{session}"),
+        }
+    }
+
+    pub(crate) fn caller_context() -> Result<Value, String> {
+        // Keep native identity precedence; environment hints alone grant no authority.
+        if let Ok(session) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+            return claude::caller_context(&session);
+        }
+        codex::caller_context()
+    }
+
+    pub(crate) fn caller_session() -> Result<String, String> {
+        if let Ok(session) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+            claude::caller_identity(&session)
+        } else {
+            codex::caller_identity()
+        }
+    }
+
+    pub(crate) fn shell_entry() -> Option<i32> {
+        claude::shell_entry()
+    }
+
+    pub(crate) fn validate_codex_request(
+        schema: &jsonschema::Validator,
+        request: &Value,
+    ) -> Result<(), String> {
+        codex::validate_request(schema, request)
+    }
+
+    pub(crate) fn policy_delivery(self) -> PolicyDelivery {
+        match self {
+            Self::Codex => PolicyDelivery::RetainedPrefix,
+            Self::Claude => PolicyDelivery::ReplaceEachTurn,
+        }
+    }
+
+    pub(crate) fn isolated_home(
+        self,
+        run: &Path,
+        authentication: &authentication::Authentication,
+    ) -> Result<Option<codex::IsolatedHome>, String> {
+        match self {
+            Self::Codex => codex::IsolatedHome::new(run, authentication).map(Some),
+            Self::Claude => Ok(None), // Native CLI owns its authentication store.
+        }
+    }
+
+    pub(crate) fn prepare_launch(
+        self,
+        options: &Options,
+        run: &Path,
+        dir: &Path,
+        handoff: &Path,
+    ) -> Result<Launch, String> {
+        let request_schema = match self {
+            Self::Codex => Some(codex::preflight(options, run, dir)?),
+            Self::Claude => None,
+        };
+        if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("interrupted before worker launch".into());
+        }
+        let command = match self {
+            Self::Codex => {
+                let mut command = codex::command(options, run, dir, handoff);
+                codex::set_worker_launcher(&mut command)?;
+                command
+            }
+            Self::Claude => claude::command(options, run, dir, handoff)?,
+        };
+        Ok(Launch {
+            command,
+            request_schema,
+        })
+    }
+
+    pub(crate) fn relevant_event(self, value: &Value) -> bool {
+        match self {
+            Self::Codex => codex::relevant_event(value),
+            Self::Claude => claude::relevant_event(value),
+        }
+    }
+
+    pub(crate) fn turn(self, request: runtime::TurnRequest<'_>) -> Result<runtime::Turn, String> {
+        match self {
+            Self::Codex => runtime::codex::turn(request),
+            Self::Claude => runtime::claude::turn(request),
+        }
+    }
+
+    pub(crate) fn for_model(model: &str) -> Self {
+        if model.starts_with("claude-") {
+            Self::Claude
+        } else {
+            // Preserve custom Codex models and configured providers. Claude aliases
+            // are deliberately not guessed: use their canonical claude-* identifier.
+            Self::Codex
+        }
+    }
+
+    pub(crate) fn executable(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    pub(crate) fn transport(self) -> &'static str {
+        match self {
+            Self::Codex => "app-server",
+            Self::Claude => "claude-stream-json",
+        }
+    }
+
+    pub(crate) fn validate_service_tier(
+        self,
+        tier: crate::profile::service_tier::Tier,
+    ) -> Result<(), String> {
+        if self == Self::Claude && tier != crate::profile::service_tier::Tier::Standard {
+            return Err(
+                "Claude service-tier selection is not supported; use --service-tier standard"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_effort(self, effort: &str) -> Result<(), String> {
+        if self == Self::Claude && !["low", "medium", "high", "xhigh", "max"].contains(&effort) {
+            return Err(format!(
+                "Claude Code does not support reasoning effort {effort}; use low, medium, high, xhigh, or max"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Harness, worker_path};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn worker_path_prefers_parent_launcher_and_preserves_ambient_order() {
+        let launcher = Path::new("/staged team/bin/pira_team");
+        let inherited = std::env::join_paths([
+            Path::new("/ambient/bin"),
+            Path::new("/other tools/bin"),
+            Path::new("/staged team/bin"),
+        ])
+        .unwrap();
+        let path = worker_path(launcher, Some(&inherited)).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/staged team/bin"),
+                PathBuf::from("/ambient/bin"),
+                PathBuf::from("/other tools/bin"),
+            ]
+        );
+        assert_eq!(
+            std::env::split_paths(&worker_path(launcher, None).unwrap()).collect::<Vec<_>>(),
+            [PathBuf::from("/staged team/bin")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_path_rejects_unrepresentable_native_shell_environment() {
+        use std::os::unix::ffi::OsStringExt;
+        let inherited = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        assert!(
+            worker_path(Path::new("/staged/pira_team"), Some(&inherited))
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn adapters_keep_native_protocols_and_owner_namespaces_separate() {
+        use serde_json::json;
+        for harness in Harness::ALL {
+            assert_eq!(Harness::from_transport(harness.transport()), Some(harness));
+        }
+        assert_eq!(Harness::from_transport("unknown-transport"), None);
+        assert_eq!(Harness::Codex.caller_identity("id"), "id");
+        assert_eq!(Harness::Claude.caller_identity("id"), "claude-id");
+        let claude = json!({"type":"result"});
+        let codex = json!({"method":"turn/completed"});
+        assert!(Harness::Claude.relevant_event(&claude));
+        assert!(!Harness::Codex.relevant_event(&claude));
+        assert!(Harness::Codex.relevant_event(&codex));
+        assert!(!Harness::Claude.relevant_event(&codex));
+        assert_eq!(
+            crate::profile::native_caller_identity(&json!({"thread_id":"id"})),
+            Some("id".into())
+        );
+        assert_eq!(
+            crate::profile::native_caller_identity(
+                &json!({"thread_id":"id","transport":"unknown"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn routes_families_without_version_inventory() {
+        for model in ["claude-haiku-5-5", "claude-future-family-100"] {
+            assert_eq!(Harness::for_model(model), Harness::Claude);
+        }
+        for model in ["gpt-6.1-sol", "gpt-future", "custom-provider-model"] {
+            assert_eq!(Harness::for_model(model), Harness::Codex);
+        }
+        assert_ne!(Harness::Claude.transport(), Harness::Codex.transport());
+        assert_eq!(Harness::Claude.executable(), "claude");
+    }
+
+    #[test]
+    fn rejects_unrepresentable_effort_without_silent_downgrade() {
+        assert!(Harness::Claude.validate_effort("ultra").is_err());
+        assert!(Harness::Claude.validate_effort("high").is_ok());
+        assert!(Harness::Codex.validate_effort("ultra").is_ok());
+    }
+}
