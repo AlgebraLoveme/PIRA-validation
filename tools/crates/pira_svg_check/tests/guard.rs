@@ -1,0 +1,1627 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use pira_svg_check::{Config, analyze_file};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn warning_codes(name: &str) -> Vec<String> {
+    analyze_file(&fixture(name), &Config::default())
+        .expect("fixture should analyze")
+        .warnings
+        .into_iter()
+        .map(|warning| warning.code)
+        .collect()
+}
+
+#[test]
+fn clear_text_has_no_warnings() {
+    assert!(warning_codes("clear.svg").is_empty());
+}
+
+#[test]
+fn line_through_word_warns_even_when_text_is_topmost() {
+    assert!(warning_codes("line_through.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
+fn closed_panel_boundary_crossing_text_edge_warns() {
+    assert!(warning_codes("boundary_through_text.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
+fn open_line_crossing_text_edge_warns() {
+    assert!(warning_codes("line_at_text_edge.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
+fn padded_stroked_panel_does_not_warn() {
+    assert!(!warning_codes("padded_stroked_panel.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
+fn opaque_backing_hides_line() {
+    let source = std::fs::read_to_string(fixture("backed_label.svg")).unwrap();
+    for family in ["sans-serif", "monospace"] {
+        let source = source.replace("sans-serif", family);
+        assert!(
+            !analyze_svg(&source)
+                .warnings
+                .iter()
+                .any(|w| w.code == "stroke-intrusion"),
+            "{family}"
+        );
+        // Removing only the occluder must restore real stroke detection. This
+        // also prevents a missing-font/no-glyph run from passing vacuously.
+        let exposed = source
+            .lines()
+            .filter(|line| !line.contains("id=\"label-backing\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            analyze_svg(&exposed)
+                .warnings
+                .iter()
+                .any(|w| w.code == "stroke-intrusion"),
+            "{family}"
+        );
+    }
+}
+
+#[test]
+fn low_contrast_warns() {
+    assert!(warning_codes("low_contrast.svg").contains(&"low-contrast".to_string()));
+}
+
+#[test]
+fn faint_text_is_not_silently_skipped() {
+    assert!(warning_codes("faint_text.svg").contains(&"low-contrast".to_string()));
+}
+
+#[test]
+fn clip_path_warns() {
+    assert!(warning_codes("clipped_text.svg").contains(&"text-clipped".to_string()));
+}
+
+#[test]
+fn cli_text_and_json_preserve_the_library_report_and_input() {
+    for (name, status) in [("clear.svg", "clear"), ("line_through.svg", "warnings")] {
+        let source = std::fs::read(fixture(name)).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("pira-svg-report-{}-{name}", std::process::id()));
+        std::fs::write(&path, &source).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let expected = analyze_file(&path, &Config::default()).unwrap();
+        assert_eq!(expected.source, path.to_string_lossy());
+        assert_eq!(expected.status, status);
+        assert!(expected.renderer.starts_with("resvg "));
+        for json in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"));
+            if json {
+                command.arg("--json");
+            }
+            let out = command.arg(&path).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert!(out.stderr.is_empty());
+            if json {
+                let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(report, serde_json::to_value(&expected).unwrap());
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                if status == "clear" {
+                    assert_eq!(text, "pira_svg_check: clear (no warnings)\n");
+                } else {
+                    assert!(text.contains("stroke-intrusion"));
+                }
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+// Fixtures live under TMPDIR when supplied by the test runner.
+fn analyze_svg(source: &str) -> pira_svg_check::Report {
+    analyze_svg_result(source).expect("SVG should analyze")
+}
+
+fn analyze_svg_result(source: &str) -> Result<pira_svg_check::Report, pira_svg_check::GuardError> {
+    analyze_svg_config(source, &Config::default())
+}
+
+fn analyze_svg_config(
+    source: &str,
+    config: &Config,
+) -> Result<pira_svg_check::Report, pira_svg_check::GuardError> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "pira-svg-{}-{}.svg",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, source).unwrap();
+    let result = analyze_file(&path, config);
+    std::fs::remove_file(path).unwrap();
+    result
+}
+
+#[test]
+fn stylesheet_loss_is_attributed_without_inactive_rule_noise() {
+    for (rule, target, width, clipped, absent) in [
+        ("text {clip-path:url(#cut)}", "", 55, true, false),
+        ("text {clip-path:url(#cut)}", "", 1, true, true),
+        ("g {mask:url(#shade)}", "", 55, true, false),
+        ("g {mask:url(#shade)!important}", "", 55, true, false),
+        ("g {clip-path:url(#cut)!important}", "", 55, true, false),
+        ("g {mask:url(#shade)!important}", "", 1, true, true),
+        ("g {mask:url(#shade)!important}", "", 300, false, false),
+        (".unused {clip-path:url(#cut)}", "", 1, false, false),
+        ("text {clip-path:url(#cut)}", "", 300, false, false),
+        ("text {display:none}", "", 1, false, true),
+        ("", "clip-path='url(#cut)'", 1, true, true),
+    ] {
+        let report = analyze_svg(&format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'><defs><clipPath id='cut'><rect width='{width}' height='80'/></clipPath><mask id='shade' maskUnits='userSpaceOnUse' x='0' y='0' width='300' height='80'><rect width='{width}' height='80' fill='white'/></mask></defs><style>{rule}</style><g><text id='label' x='20' y='45' font-size='24' {target}>Visible label</text></g></svg>"
+        ));
+        for code in ["text-clipped", "text-not-rendered"] {
+            let expected = if code == "text-clipped" {
+                clipped
+            } else {
+                absent
+            };
+            assert_eq!(
+                report.warnings.iter().any(|w| w.code == code),
+                expected,
+                "{rule} {target} {width}: {report:?}"
+            );
+        }
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| w.text_element.as_deref() == Some("<text#label>"))
+        );
+    }
+}
+
+#[test]
+fn inline_clipping_declarations_are_not_inert_strings_or_comments() {
+    for (style, expected) in [
+        ("font-family:'clip-path:url(#cut)';fill:black", false),
+        ("/* mask:url(#cut) */fill:black", false),
+        ("clip-path:none;clip-path:url(#cut)", true),
+        ("clip-path/**/:url(#cut)", true),
+        ("clip-path&#9;:url(#cut)", true),
+    ] {
+        let report = analyze_svg(&format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'><defs><clipPath id='cut'><rect width='55' height='80'/></clipPath></defs><text x='20' y='45' font-size='24' style=\"{style}\">Visible label</text></svg>"
+        ));
+        assert_eq!(
+            report.warnings.iter().any(|w| w.code == "text-clipped"),
+            expected,
+            "{style}: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn foreign_metadata_cannot_shadow_identity_membership_or_rendering() {
+    for attrs in [
+        "m:id='wrong' m:data-pira-svg-check-key='wrong' m:mask='metadata' m:style='fill:none'",
+        "m:fill='none' m:opacity='0' m:clip-path='metadata'",
+    ] {
+        let report = analyze_svg(&format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' xmlns:m='urn:metadata' width='300' height='80'><text {attrs} id='label' x='20' y='45' font-size='24' fill='#ddd'>Visible label</text></svg>"
+        ));
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        assert_eq!(report.warnings[0].code, "low-contrast");
+        assert_eq!(
+            report.warnings[0].text_element.as_deref(),
+            Some("<text#label>")
+        );
+    }
+}
+
+#[test]
+fn content_derived_canvas_survives_variant_removal() {
+    let report = analyze_svg(
+        "<svg xmlns='http://www.w3.org/2000/svg'><rect x='0' y='0' width='300' height='80' fill='white'/><text id='label' x='20' y='45' font-size='24' fill='#ddd'>Visible label</text><path d='M20 36H150' stroke='black'/></svg>",
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.code == "low-contrast"),
+        "{report:?}"
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.code == "stroke-intrusion"),
+        "{report:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_font_directory_path_is_accepted() {
+    use std::os::unix::ffi::OsStringExt;
+    let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(
+        format!("pira-svg-font-{}-", std::process::id())
+            .into_bytes()
+            .into_iter()
+            .chain([255])
+            .collect(),
+    ));
+    // macOS filesystems reject invalid UTF-8 names. Still exercise native argv
+    // handling there, like any nonexistent optional font directory; other Unix
+    // platforms additionally exercise an existing directory with that name.
+    #[cfg(not(target_os = "macos"))]
+    std::fs::create_dir(&path).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+        .arg("--font-dir")
+        .arg(&path)
+        .arg(fixture("clear.svg"))
+        .output()
+        .unwrap();
+    #[cfg(not(target_os = "macos"))]
+    std::fs::remove_dir(&path).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("clear"));
+}
+
+#[test]
+fn namespace_metadata_does_not_change_visible_text() {
+    for (extra, attrs) in [
+        ("", "xml:style='fill:none'"),
+        (
+            "",
+            "xmlns:l='http://www.w3.org/1999/xlink' l:style='fill:none' l:fill='none'",
+        ),
+        ("", "xmlns:m='urn:meta' m:href='https://example.invalid'"),
+        ("<m:text xmlns:m='urn:meta'>metadata</m:text>", ""),
+        (
+            "<m:container xmlns:m='urn:meta'><text>metadata</text></m:container>",
+            "",
+        ),
+        ("<style xmlns='urn:meta'>text {fill:none}</style>", ""),
+        (
+            "<m:style xmlns:m='urn:meta'><![CDATA[text {fill:url(https://example.invalid)}]]></m:style>",
+            "",
+        ),
+    ] {
+        let source = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'>{extra}<text id='label' x='20' y='45' font-size='24' {attrs}>Visible label</text></svg>"
+        );
+        let report = analyze_svg(&source);
+        assert!(report.warnings.is_empty(), "{source}: {report:?}");
+    }
+}
+
+#[test]
+fn prefixed_svg_and_alternate_xlink_keep_rendering() {
+    let report = analyze_svg(
+        "<s:svg xmlns:s='http://www.w3.org/2000/svg' xmlns:l='http://www.w3.org/1999/xlink' width='300' height='80'><s:defs><s:rect id='back' width='300' height='80' fill='white'/></s:defs><s:use l:href='#back'/><s:text id='label' x='20' y='45' font-size='24' xml:space='preserve'>Visible label</s:text></s:svg>",
+    );
+    assert!(report.warnings.is_empty(), "{report:?}");
+}
+
+#[test]
+fn important_author_declarations_cannot_defeat_text_variants() {
+    for (rules, attrs, expected) in [
+        ("text {display:inline!important}", "", None),
+        ("* {display:inline!important}", "", None),
+        ("", "style='display:inline!important'", None),
+        (
+            "text {stroke:black!important;stroke-width:5}",
+            "fill='none'",
+            Some("text-not-rendered"),
+        ),
+        (
+            "",
+            "fill='none' style='stroke:black!important;stroke-width:5'",
+            Some("text-not-rendered"),
+        ),
+        (
+            "g {fill:#ddd} text {fill:inherit}",
+            "",
+            Some("low-contrast"),
+        ),
+    ] {
+        let source = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'><style>{rules}</style><g><text id='label' x='20' y='45' font-size='24' {attrs}>Visible label</text></g></svg>"
+        );
+        let report = analyze_svg(&source);
+        let codes: Vec<_> = report
+            .warnings
+            .iter()
+            .map(|warning| warning.code.as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            expected.into_iter().collect::<Vec<_>>(),
+            "{source}: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn referenced_image_under_foreign_parent_cannot_read_external_png() {
+    let directory = std::env::temp_dir().join(format!("pira-svg-resource-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let image = directory.join("harmless-red.png");
+    let mut pixels = resvg::tiny_skia::Pixmap::new(10, 10).unwrap();
+    pixels.fill(resvg::tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+    pixels.save_png(&image).unwrap();
+    let input = directory.join("input.svg");
+    let image_href = quick_xml::escape::escape(image.to_str().unwrap());
+    for (container, attribute) in [
+        ("g", "href"),
+        ("m:container", "href"),
+        ("m:container", "l:href"),
+    ] {
+        let source = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' xmlns:m='urn:metadata' xmlns:l='http://www.w3.org/1999/xlink' width='100' height='50'><{container}><image id='external' {attribute}=\"{image_href}\" width='10' height='10'/></{container}><use href='#external'/><text x='20' y='30' font-size='14'>OK</text></svg>"
+        );
+        std::fs::write(&input, source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+            .arg("--json")
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{container} {attribute}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("external SVG resource"));
+    }
+    std::fs::remove_file(input).unwrap();
+    std::fs::remove_file(image).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn resolved_instances_match_inline_text_fill_and_stroke() {
+    let wrap = |body: &str| {
+        format!("<svg xmlns='http://www.w3.org/2000/svg' width='320' height='160'>{body}</svg>")
+    };
+    let codes = |report: &pira_svg_check::Report| {
+        let mut codes: Vec<_> = report.warnings.iter().map(|w| w.code.clone()).collect();
+        codes.sort();
+        codes
+    };
+    let label = "<text x='20' y='45' font-size='24' fill='#ddd'>Visible label</text>";
+    let inline = wrap(&format!(
+        "<g transform='translate(5 5)'>{label}</g><g transform='translate(5 75)'>{label}</g>"
+    ));
+    let referenced = wrap(&format!(
+        "<defs><g id='label'>{label}</g><g id='nested'><use href='#label'/></g></defs><use href='#nested' transform='translate(5 5)'/><use href='#nested' transform='translate(5 75)'/>"
+    ));
+    let inline = analyze_svg(&inline);
+    let report = analyze_svg(&referenced);
+    assert_eq!(codes(&inline), vec!["low-contrast", "low-contrast"]);
+    assert_eq!(codes(&inline), codes(&report));
+    assert_ne!(
+        report.warnings[0].text_element,
+        report.warnings[1].text_element
+    );
+
+    let inherited = label.replace("fill='#ddd'", "fill='inherit'");
+    let independent = wrap(&format!(
+        "<defs><g id='label'>{inherited}</g></defs><use href='#label' fill='#ddd'/><use href='#label' fill='black' y='75'/>"
+    ));
+    assert_eq!(codes(&analyze_svg(&independent)), vec!["low-contrast"]);
+
+    let black = label.replace("#ddd", "black");
+    for (paint, stroked) in [
+        ("fill='black'", false),
+        ("fill='none' stroke='black' stroke-width='2'", true),
+    ] {
+        let shape = format!("<rect id='shape' x='0' y='30' width='260' height='3' {paint}/>");
+        let inline = wrap(&format!("{shape}{black}"));
+        let referenced = wrap(&format!("<defs>{shape}</defs><use href='#shape'/>{black}"));
+        let inline = analyze_svg(&inline);
+        let referenced = analyze_svg(&referenced);
+        assert_eq!(codes(&inline), codes(&referenced), "{paint}");
+        assert_eq!(
+            codes(&referenced).iter().any(|c| c == "stroke-intrusion"),
+            stroked
+        );
+    }
+}
+
+#[test]
+fn masks_keep_scene_backed_dependencies_and_only_warn_on_loss() {
+    for scene_backed in [false, true] {
+        for width in [55, 300] {
+            let shape = format!("<rect id='back' width='{width}' height='80' fill='white'/>");
+            let source = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'>{}<defs>{}<mask id='m' maskUnits='userSpaceOnUse' x='0' y='0' width='300' height='80'><use href='#back'/></mask></defs><text x='20' y='45' font-size='24' mask='url(#m)'>Visible label</text></svg>",
+                if scene_backed { &shape } else { "" },
+                if scene_backed { "" } else { &shape }
+            );
+            let report = analyze_svg(&source);
+            assert_eq!(
+                report.warnings.iter().any(|w| w.code == "text-clipped"),
+                width == 55,
+                "{report:?}"
+            );
+            assert!(
+                !report
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "text-not-rendered"),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clipping_loss_is_independent_of_declaration_location_and_references() {
+    for referenced in [false, true] {
+        for (attrs, rules, width, loss) in [
+            ("clip-path='url(#c)'", "", 300, false),
+            ("clip-path='url(#c)'", "g {clip-path:none}", 1, false),
+            ("style='clip-path:url(#c);clip-path:none'", "", 1, false),
+            ("style='clip-path:url(#c)'", "", 55, true),
+            ("", "g {clip-path:url(#c)!important}", 55, true),
+        ] {
+            let text = "<text x='20' y='45' font-size='24'>Visible label</text>";
+            let body = if referenced {
+                format!("<defs><g id='label'>{text}</g></defs><use href='#label'/>")
+            } else {
+                text.to_string()
+            };
+            let source = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'><defs><clipPath id='c'><rect width='{width}' height='80'/></clipPath></defs><style>{rules}</style><g {attrs}>{body}</g></svg>"
+            );
+            let report = analyze_svg(&source);
+            assert_eq!(
+                report.warnings.iter().any(|w| w.code == "text-clipped"),
+                loss,
+                "{source}: {report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn isolated_fonts_require_inventory_and_report_missing_selection_and_glyphs() {
+    use resvg::usvg::fontdb::Database;
+    let directory = std::env::temp_dir().join(format!("pira-svg-fonts-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("input.svg");
+    let svg = |family: &str, text: &str| {
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'><text x='20' y='45' font-size='24' font-family='{family}'>{text}</text></svg>"
+        )
+    };
+    let config = Config {
+        isolated_fonts: true,
+        font_dirs: vec![directory.clone()],
+        ..Config::default()
+    };
+    std::fs::write(&path, svg("MissingPiraFont", "Hello")).unwrap();
+    assert!(
+        analyze_file(&path, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("missing font family")
+    );
+    // Copy one real font into the isolated set; production never loads system fonts
+    // in this mode. Like the existing rendering tests, this test needs host fonts.
+    let mut database = Database::new();
+    database.load_system_fonts();
+    let face = database
+        .faces()
+        .next()
+        .expect("render tests require a system font");
+    let family = face.families[0].0.clone();
+    let bytes = database
+        .with_face_data(face.id, |data, _| data.to_vec())
+        .unwrap();
+    std::fs::write(directory.join("font.ttf"), bytes).unwrap();
+    let mut isolated_database = Database::new();
+    isolated_database.load_fonts_dir(&directory);
+    let host_only = database
+        .faces()
+        .flat_map(|face| &face.families)
+        .find(|(name, _)| {
+            !isolated_database
+                .faces()
+                .any(|face| face.families.iter().any(|(isolated, _)| isolated == name))
+        })
+        .expect("system inventory must contain another font family")
+        .0
+        .clone();
+    std::fs::write(&path, svg(&quick_xml::escape::escape(&host_only), "Hello")).unwrap();
+    assert!(analyze_file(&path, &Config::default()).is_ok());
+    assert!(
+        analyze_file(&path, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("missing font family")
+    );
+    let family = quick_xml::escape::escape(&family);
+    std::fs::write(&path, svg(&family, "Hello")).unwrap();
+    assert!(analyze_file(&path, &config).is_ok());
+    let empty = directory.join("empty-fonts");
+    std::fs::create_dir(&empty).unwrap();
+    // Both orders distinguish repeatable/additive arguments from first/last-only
+    // selection, without imposing a second host font's glyph repertoire.
+    for dirs in [[&directory, &empty], [&empty, &directory]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+            .args(["--json", "--isolated-fonts", "--font-dir"])
+            .arg(dirs[0])
+            .arg("--font-dir")
+            .arg(dirs[1])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["warnings"], serde_json::json!([]));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+        .args(["--isolated-fonts", "--font-dir"])
+        .arg(directory.join("missing-fonts"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("cannot read isolated font directory")
+    );
+    std::fs::write(&path, svg(&family, "Hello &#x10FFFF;")).unwrap();
+    assert!(
+        analyze_file(&path, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("missing glyph U+10FFFF")
+    );
+    std::fs::write(&path, svg("MissingPiraFont", "Hello")).unwrap();
+    assert!(
+        analyze_file(&path, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("missing font family")
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+        .args(["--isolated-fonts"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--font-dir"));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn reference_serialization_loss_fails_visibly() {
+    let path = std::env::temp_dir().join(format!("pira-svg-precision-{}.svg", std::process::id()));
+    // The renderer can paint this geometry, but the SVG writer's decimal
+    // precision collapses it. Returning no-semantic-text would hide that loss.
+    std::fs::write(&path, "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='100' viewBox='0 0 0.000000003 0.000000001'><defs><rect id='r' width='0.000000001' height='0.000000001'/></defs><use href='#r'/></svg>").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported scene analysis"));
+}
+
+#[test]
+fn object_bounds_effects_preserve_sibling_geometry_before_isolation() {
+    for mask in [false, true] {
+        for (width, loss) in [(0.5, false), (0.1, true)] {
+            for extra in ["", "<defs><g id='empty'/></defs><use href='#empty'/>"] {
+                let (definition, effect) = if mask {
+                    (
+                        format!(
+                            "<mask id='c' maskUnits='objectBoundingBox' maskContentUnits='objectBoundingBox' x='0' y='0' width='1' height='1'><rect width='{width}' height='1' fill='white'/></mask>"
+                        ),
+                        "mask",
+                    )
+                } else {
+                    (
+                        format!(
+                            "<clipPath id='c' clipPathUnits='objectBoundingBox'><rect width='{width}' height='1'/></clipPath>"
+                        ),
+                        "clip-path",
+                    )
+                };
+                let source = format!(
+                    "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='120'><defs>{definition}</defs><g transform='translate(5 5)'><g {effect}='url(#c)'><text x='20' y='50' font-size='24'>Hello</text><rect x='200' width='50' height='80'/></g></g>{extra}</svg>"
+                );
+                let report = analyze_svg(&source);
+                let codes: Vec<_> = report
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.code.as_str())
+                    .collect();
+                assert_eq!(
+                    codes,
+                    if loss { vec!["text-clipped"] } else { vec![] },
+                    "{source}: {report:?}"
+                );
+            }
+        }
+    }
+}
+
+// These two real fonts reproduce usvg's glyph-count-changing fallback. Keep
+// this platform fixture explicit rather than silently substituting other fonts.
+#[cfg(target_os = "macos")]
+#[test]
+fn isolated_final_shaping_rejects_unresolved_complex_clusters() {
+    let directory = std::env::temp_dir().join(format!("pira-svg-shaping-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    for name in ["Georgia.ttf", "Arial Unicode.ttf"] {
+        std::fs::copy(
+            Path::new("/System/Library/Fonts/Supplemental").join(name),
+            directory.join(name),
+        )
+        .expect(
+            "mixed-script regression requires macOS Georgia and Arial Unicode supplemental fonts",
+        );
+    }
+    let path = directory.join("input.svg");
+    let config = Config {
+        isolated_fonts: true,
+        font_dirs: vec![directory.clone()],
+        ..Config::default()
+    };
+    for content in ["لا", "क्ष", "ffi 汉"] {
+        let svg = |text: &str| {
+            format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='100'><text x='20' y='50' font-size='24' font-family='Georgia'>{text}</text></svg>"
+            )
+        };
+        std::fs::write(&path, svg(content)).unwrap();
+        assert!(analyze_file(&path, &config).is_ok(), "covered {content}");
+        std::fs::write(&path, svg(&format!("{content} &#x10FFFF;"))).unwrap();
+        let error = analyze_file(&path, &config).unwrap_err().to_string();
+        assert!(
+            error.contains("isolated fonts:")
+                && error.contains("glyph")
+                && error.contains("--font-dir"),
+            "{content}: {error}"
+        );
+    }
+    // Text in paint/dependency subtrees must be validated too, not only labels.
+    std::fs::write(&path, "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='100'><defs><pattern id='p' patternUnits='userSpaceOnUse' width='300' height='100'><text x='20' y='50' font-size='24' font-family='Georgia'>لا &#x10FFFF;</text></pattern></defs><rect width='300' height='100' fill='url(#p)'/></svg>").unwrap();
+    assert!(
+        analyze_file(&path, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved shaped glyph")
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn fragment_images_never_fall_back_to_filesystem_paths() {
+    let directory = std::env::temp_dir().join(format!("pira-svg-fragment-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("#anchor")).unwrap();
+    let backing = "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'><rect width='300' height='80' fill='black'/></svg>";
+    for name in ["#back.svg", "ordinary.svg"] {
+        std::fs::write(directory.join(name), backing).unwrap();
+    }
+    // POSIX filenames can also masquerade as malformed data URLs.
+    #[cfg(unix)]
+    std::fs::write(directory.join("data:back.svg"), backing).unwrap();
+    let input = directory.join("input.svg");
+    let hrefs = [
+        "#back.svg",
+        "#anchor/../ordinary.svg",
+        #[cfg(unix)]
+        "data:back.svg",
+    ];
+    for href in hrefs {
+        for resource in [
+            format!("<image href='{href}' width='300' height='80'/>"),
+            format!(
+                "<defs><filter id='f' x='0' y='0' width='300' height='80' filterUnits='userSpaceOnUse'><feImage href='{href}'/></filter></defs><rect width='300' height='80' filter='url(#f)'/>"
+            ),
+        ] {
+            let source = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='80'>{resource}<text x='20' y='45' font-family='sans-serif' font-size='24'>Visible label</text></svg>"
+            );
+            std::fs::write(&input, &source).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+                .current_dir(&directory)
+                .arg("--json")
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{href}: {:?}", output);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            // Black glyphs on the white canvas must be measurable and clear, not
+            // hidden against the black filesystem image or absent due to no font.
+            assert_eq!(
+                report["warnings"],
+                serde_json::json!([]),
+                "{resource}: {report}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn mixed_opacity_spans_keep_geometric_contrast_coverage() {
+    for family in ["sans-serif", "monospace"] {
+        for (paint, low) in [
+            ("fill-opacity='.1'", true),
+            ("fill-opacity='.5'", true),
+            ("style='fill-opacity:.1!important'", true),
+            ("fill='#e5e5e5'", true),
+            ("fill='black'", false),
+        ] {
+            for referenced in [false, true] {
+                let text = format!(
+                    "<text x='20' y='50' font-family='{family}' font-size='28'>Solid <tspan {paint}>Faint label</tspan></text>"
+                );
+                let body = if referenced {
+                    format!("<defs><g id='label'>{text}</g></defs><use href='#label'/>")
+                } else {
+                    text
+                };
+                let report = analyze_svg(&format!(
+                    "<svg xmlns='http://www.w3.org/2000/svg' width='500' height='100'>{body}</svg>"
+                ));
+                assert_eq!(
+                    report.warnings.iter().any(|w| w.code == "low-contrast"),
+                    low,
+                    "{family} {paint} {referenced}: {report:?}"
+                );
+                assert!(
+                    !report
+                        .warnings
+                        .iter()
+                        .any(|w| w.code == "text-not-rendered"),
+                    "{report:?}"
+                );
+                if !low {
+                    assert!(report.warnings.is_empty(), "{report:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn excessive_svg_nesting_is_a_handled_analysis_error() {
+    let directory = std::env::temp_dir().join(format!("pira-svg-depth-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let input = directory.join("input.svg");
+    let nested = |groups: usize| {
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='500' height='100'>{}<rect width='10' height='10'/>{}</svg>",
+            "<g>".repeat(groups),
+            "</g>".repeat(groups)
+        )
+    };
+    let image = |source: &str, mime: &str| {
+        let encoded: String = source.bytes().map(|byte| format!("%{byte:02X}")).collect();
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='500' height='100'><image href='data:{mime},{encoded}' width='500' height='100'/></svg>"
+        )
+    };
+    let mut cases = vec![
+        (nested(62), false),
+        (nested(63), true),
+        (nested(15_000), true),
+    ];
+    for mime in ["image/svg+xml", "text/plain"] {
+        cases.push((image(&nested(15_000), mime), true));
+        cases.push((image(&nested(60), mime), false));
+        cases.push((image(&nested(61), mime), true));
+    }
+    let mut recursive = nested(0);
+    for layers in 1..=5 {
+        recursive = image(&recursive, "image/svg+xml");
+        if layers >= 4 {
+            cases.push((recursive.clone(), layers == 5));
+        }
+    }
+    for (source, rejected) in cases {
+        std::fs::write(&input, source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+            .arg("--json")
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if rejected { 2 } else { 0 }),
+            "{:?}",
+            output
+        );
+        if rejected {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("nesting limit"),
+                "{:?}",
+                output
+            );
+            assert!(output.stdout.is_empty());
+        } else {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["warnings"][0]["code"], "no-semantic-text");
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn mixed_opacity_coverage_preserves_mask_loss_and_occlusion() {
+    for width in [180, 500] {
+        let report = analyze_svg(&format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='500' height='100'><defs><mask id='m' maskUnits='userSpaceOnUse' x='0' y='0' width='500' height='100'><rect width='{width}' height='100' fill='white'/></mask></defs><text x='20' y='50' font-family='sans-serif' font-size='28' mask='url(#m)'>Solid<tspan x='180' fill-opacity='.1'>Faint label</tspan></text></svg>"
+        ));
+        assert_eq!(
+            report.warnings.iter().any(|w| w.code == "text-clipped"),
+            width == 180,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.warnings.iter().any(|w| w.code == "low-contrast"),
+            width == 500,
+            "{report:?}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-not-rendered"),
+            "{report:?}"
+        );
+    }
+}
+
+fn svg_data(source: &str, mime: &str) -> String {
+    let encoded: String = source.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    format!("data:{mime},{encoded}")
+}
+
+fn embedded_svg(source: &str, mime: &str, tag: &str) -> String {
+    let data = svg_data(source, mime);
+    let image = format!("<{tag} href='{data}' width='240' height='100'/>");
+    let body = if tag == "feImage" {
+        format!(
+            "<defs><filter id='f' x='0' y='0' width='240' height='100' filterUnits='userSpaceOnUse'>{image}</filter></defs><rect width='240' height='100' filter='url(#f)'/>"
+        )
+    } else {
+        image
+    };
+    format!(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='100'>{body}<text id='label' x='60' y='58' font-family='sans-serif' font-size='24'>Clear label</text></svg>"
+    )
+}
+
+#[test]
+fn regression_embedded_resources_are_rejected_before_rendering() {
+    for (source, reason) in [
+        (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><image href='https://example.invalid/x' width='10' height='10'/></svg>",
+            "external",
+        ),
+        (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10' fill='url(https://example.invalid/p)'/></svg>",
+            "external",
+        ),
+        (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><style>@import 'https://example.invalid/s';</style></svg>",
+            "external",
+        ),
+        (
+            "<?xml-stylesheet href='https://example.invalid/s'?><svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>",
+            "external",
+        ),
+        (
+            "<!DOCTYPE svg><svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>",
+            "document types",
+        ),
+    ] {
+        for mime in ["image/svg+xml", "text/plain"] {
+            for tag in ["image", "feImage"] {
+                let error = analyze_svg_result(&embedded_svg(source, mime, tag)).unwrap_err();
+                assert!(error.to_string().contains(reason), "{mime} {tag}: {error}");
+            }
+        }
+        let nested = embedded_svg(source, "text/plain", "image");
+        let error =
+            analyze_svg_result(&embedded_svg(&nested, "image/svg+xml", "image")).unwrap_err();
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+}
+
+#[test]
+fn regression_embedded_metadata_and_namespaces_remain_inert() {
+    let outer =
+        "<svg xmlns='http://www.w3.org/2000/svg'><metadata data-pira-svg-check-key='inert'/></svg>";
+    assert!(
+        analyze_svg_result(outer)
+            .unwrap_err()
+            .to_string()
+            .contains("reserved SVG attribute")
+    );
+    for mime in ["image/svg+xml", "text/plain"] {
+        for (fill, metadata_style, low) in [("white", "black", false), ("black", "white", true)] {
+            let source = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' xmlns:m='urn:metadata' width='240' height='100'><metadata data-pira-svg-check-key='inert'/><rect width='240' height='100' fill='{fill}' m:style='fill:{metadata_style}'/></svg>"
+            );
+            let report = analyze_svg(&embedded_svg(&source, mime, "image"));
+            let codes: Vec<_> = report.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                if low { vec!["low-contrast"] } else { vec![] },
+                "{source}: {report:?}"
+            );
+            let direct = source.replace("</svg>", "<text id='label' x='60' y='58' font-family='sans-serif' font-size='24'>Clear label</text></svg>")
+                .replace("<metadata data-pira-svg-check-key='inert'/>", "<metadata/>");
+            assert_eq!(report.warnings, analyze_svg(&direct).warnings);
+        }
+        let source = "<svg xmlns='http://www.w3.org/2000/svg' xmlns:m='urn:metadata' width='240' height='100'><m:style>text {fill:url(https://example.invalid/p)}</m:style><rect width='240' height='100' fill='white'/></svg>";
+        assert!(
+            analyze_svg(&embedded_svg(source, mime, "image"))
+                .warnings
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn regression_sibling_filter_output_does_not_pollute_text_probes() {
+    let vector = svg_data(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10'/></svg>",
+        "image/svg+xml",
+    );
+    let raster = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
+    for effect in [
+        format!("<feImage href='{vector}'/>"),
+        format!("<feImage href='{raster}'/>"),
+        "<feFlood flood-color='red'/>".to_string(),
+    ] {
+        let svg = |stroke: &str| {
+            format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='100'><defs><filter id='f' x='0' y='0' width='10' height='10' filterUnits='userSpaceOnUse'>{effect}</filter></defs><g opacity='.8'><g><g filter='url(#f)'><rect width='10' height='10'/></g></g>{stroke}<text id='label' x='60' y='58' font-family='sans-serif' font-size='24'>Clear label</text></g></svg>"
+            )
+        };
+        assert!(analyze_svg(&svg("")).warnings.is_empty(), "{effect}");
+        let source = svg("<path d='M50 48H210' stroke='black'/>");
+        let report = analyze_svg(&source);
+        // A same-color line through glyphs can legitimately reduce contrast.
+        // Distant filter artwork must neither add nor remove those real warnings.
+        let control = source.replace(
+            "<g><g filter='url(#f)'><rect width='10' height='10'/></g></g>",
+            "",
+        );
+        let expected = analyze_svg(&control);
+        assert!(
+            expected
+                .warnings
+                .iter()
+                .any(|w| w.code == "stroke-intrusion")
+        );
+        let summaries = |report: pira_svg_check::Report| {
+            report
+                .warnings
+                .into_iter()
+                .map(|w| (w.code, w.message))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(summaries(report), summaries(expected), "{effect}");
+    }
+}
+
+fn cli_svg(source: &str, args: &[&str]) -> std::process::Output {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "pira-svg-cli-{}-{}.svg",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+        .args(args)
+        .arg(&path)
+        .output();
+    assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+    std::fs::remove_file(path).unwrap();
+    output.unwrap()
+}
+
+#[test]
+fn regression_plain_diagnostics_escape_controls_without_changing_json_values() {
+    for (entity, raw, escaped) in [("&#10;", '\n', "\\n"), ("&#13;", '\r', "\\r")] {
+        let error_svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg'><image href='https://example.invalid/a{entity}PIRA_SPOOF'/></svg>"
+        );
+        for args in [&[][..], &["--json"][..]] {
+            let output = cli_svg(&error_svg, args);
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+            assert!(
+                stderr.contains(&format!("a{escaped}PIRA_SPOOF")),
+                "{stderr:?}"
+            );
+            assert!(!stderr.trim_end_matches('\n').contains(raw));
+        }
+        // The second ID appears both as interference and inside the overlap message.
+        let warning_svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='100'><text id='first{entity}PIRA_SPOOF' x='20' y='58' font-family='sans-serif' font-size='24' fill='#eee'>Label</text><text id='second{entity}PIRA_SPOOF' x='20' y='58' font-family='sans-serif' font-size='24' fill='#eee'>Label</text></svg>"
+        );
+        let plain = cli_svg(&warning_svg, &[]);
+        let json = cli_svg(&warning_svg, &["--json"]);
+        assert_eq!(plain.status.code(), Some(0));
+        assert_eq!(json.status.code(), Some(0));
+        assert!(plain.stderr.is_empty() && json.stderr.is_empty());
+        let plain = String::from_utf8(plain.stdout).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        let warnings = report["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 3);
+        assert_eq!(plain.lines().count(), warnings.len() + 1, "{plain:?}");
+        assert!(!plain.contains('\r'));
+        assert!(plain.contains(&format!("first{escaped}PIRA_SPOOF")));
+        assert!(plain.contains(&format!("second{escaped}PIRA_SPOOF")));
+        assert!(warnings.iter().any(|w| w["code"] == "text-overlap"));
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w["text_element"].as_str().unwrap().contains(raw))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["message"].as_str().unwrap().contains(raw))
+        );
+    }
+}
+
+#[test]
+fn regression_internal_keys_cannot_change_author_css_or_text_identity() {
+    let template = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='80'><style>RULE</style><text id='label' x='10' y='50' font-family='sans-serif' font-size='26' fill='#eee'>A &amp; B</text></svg>";
+    let expected = analyze_svg(&template.replace("RULE", ""));
+    assert!(expected.warnings.iter().any(|w| w.code == "low-contrast"));
+    for rule in [
+        "[data-pira-svg-check-key] {fill:black}",
+        "[data-pira-svg-check-key] {display:none!important}",
+        "text:not([data-pira-svg-check-key]) {fill:#eee}",
+        "[style] {fill:black}",
+    ] {
+        let report = analyze_svg(&template.replace("RULE", rule));
+        assert_eq!(report.warnings, expected.warnings, "{rule}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.text.as_deref() == Some("A & B")
+                    && w.text_element.as_deref() == Some("<text#label>"))
+        );
+    }
+}
+
+#[test]
+fn element_count_limit_applies_to_outer_and_embedded_documents() {
+    // The root counts too. Empty siblings exercise breadth without approaching
+    // the independent depth, byte, pixel or retained-mask limits.
+    for (children, rejected) in [(49_999, false), (50_000, true)] {
+        let source = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'>{}</svg>",
+            "<g/>".repeat(children)
+        );
+        for embedded in [false, true] {
+            let input = if embedded {
+                embedded_svg(&source, "text/plain", "feImage")
+            } else {
+                source.clone()
+            };
+            let result = analyze_svg_result(&input);
+            if rejected {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("element-count limit"),
+                    "children={children}, embedded={embedded}"
+                );
+            } else {
+                let report = result.unwrap();
+                let codes: Vec<_> = report.warnings.iter().map(|w| w.code.as_str()).collect();
+                assert_eq!(
+                    codes,
+                    if embedded {
+                        vec![]
+                    } else {
+                        vec!["no-semantic-text"]
+                    },
+                    "children={children}, embedded={embedded}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn numeric_cli_options_validate_values_and_inclusive_endpoints() {
+    let source = "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>";
+    for (option, valid, invalid, reason) in [
+        (
+            "--scale",
+            vec!["0.5"],
+            vec!["0", "-1", "NaN", "inf"],
+            "scale must be positive",
+        ),
+        (
+            "--min-contrast",
+            vec!["1", "21"],
+            vec!["0.99", "21.01", "NaN", "inf"],
+            "minimum contrast",
+        ),
+        (
+            "--crossing-ratio",
+            vec!["0", "1"],
+            vec!["-0.01", "1.01", "NaN", "inf"],
+            "fraction options",
+        ),
+    ] {
+        for value in valid {
+            let out = cli_svg(source, &["--json", option, value]);
+            assert_eq!(out.status.code(), Some(0), "{option} {value}: {out:?}");
+            assert!(out.stderr.is_empty());
+            let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(report["warnings"][0]["code"], "no-semantic-text");
+        }
+        for value in invalid.into_iter().chain(["not-a-number"]) {
+            let out = cli_svg(source, &[option, value]);
+            assert_eq!(out.status.code(), Some(2), "{option} {value}: {out:?}");
+            assert!(out.stdout.is_empty());
+            let diagnostic = String::from_utf8(out.stderr).unwrap();
+            let expected = if value == "not-a-number" {
+                "invalid numeric value"
+            } else {
+                reason
+            };
+            assert!(
+                diagnostic.contains(expected),
+                "{option} {value}: {diagnostic}"
+            );
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+            .arg(fixture("clear.svg"))
+            .arg(option)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(
+            String::from_utf8(out.stderr)
+                .unwrap()
+                .contains(&format!("missing value for {option}"))
+        );
+    }
+}
+
+#[test]
+fn contrast_option_changes_the_report_and_warnings_remain_advisory() {
+    let source = std::fs::read_to_string(fixture("low_contrast.svg")).unwrap();
+    for (args, low) in [
+        (vec!["--json"], true),
+        (vec!["--json", "--min-contrast", "1"], false),
+    ] {
+        let out = cli_svg(&source, &args);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["status"], if low { "warnings" } else { "clear" });
+        assert_eq!(
+            report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "low-contrast"),
+            low
+        );
+        assert!(
+            !report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "text-not-rendered")
+        );
+    }
+}
+
+#[test]
+fn scale_option_controls_the_render_pixel_limit() {
+    let source = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'/>";
+    for (scale, rejected) in [("1", false), ("100", true)] {
+        let out = cli_svg(source, &["--scale", scale]);
+        assert_eq!(out.status.code(), Some(if rejected { 2 } else { 0 }));
+        if rejected {
+            assert!(out.stdout.is_empty());
+            assert!(
+                String::from_utf8(out.stderr)
+                    .unwrap()
+                    .contains("pixel limit")
+            );
+        } else {
+            assert!(out.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn public_input_byte_limit_accepts_exact_size_and_rejects_the_next_byte() {
+    let source = "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>";
+    for (limit, rejected) in [(source.len(), false), (source.len() - 1, true)] {
+        let result = analyze_svg_config(
+            source,
+            &Config {
+                max_svg_bytes: limit,
+                ..Config::default()
+            },
+        );
+        if rejected {
+            assert!(result.unwrap_err().to_string().contains("input-size"));
+        } else {
+            assert_eq!(result.unwrap().warnings[0].code, "no-semantic-text");
+        }
+    }
+}
+
+#[test]
+fn public_low_contrast_fraction_validates_and_controls_warning_acceptance() {
+    let path = fixture("low_contrast.svg");
+    for fraction in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+        let result = analyze_file(
+            &path,
+            &Config {
+                max_low_contrast_fraction: fraction,
+                ..Config::default()
+            },
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("fraction options"),
+            "{fraction}"
+        );
+    }
+    for (fraction, low) in [(0.0, true), (1.0, false)] {
+        let report = analyze_file(
+            &path,
+            &Config {
+                max_low_contrast_fraction: fraction,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.warnings.iter().any(|w| w.code == "low-contrast"),
+            low
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-not-rendered")
+        );
+    }
+}
+
+// Independent resvg geometry is a fixture prerequisite, not an oracle copied
+// from the checker's warning output. Match the checker's system-font inventory.
+fn render_probe(source: &str) -> resvg::tiny_skia::Pixmap {
+    let mut database = resvg::usvg::fontdb::Database::new();
+    database.load_system_fonts();
+    let options = resvg::usvg::Options {
+        fontdb: std::sync::Arc::new(database),
+        ..Default::default()
+    };
+    let tree = resvg::usvg::Tree::from_str(source, &options).unwrap();
+    let size = tree.size().to_int_size();
+    let mut image = resvg::tiny_skia::Pixmap::new(size.width(), size.height()).unwrap();
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut image.as_mut(),
+    );
+    image
+}
+
+fn painted_pixels(image: &resvg::tiny_skia::Pixmap) -> std::collections::HashSet<(i32, i32)> {
+    image
+        .pixels()
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.alpha() > 0)
+        .map(|(index, _)| {
+            (
+                (index % image.width() as usize) as i32,
+                (index / image.width() as usize) as i32,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn intersecting_text_bounds_are_not_sufficient_for_glyph_overlap() {
+    let label = "<text x='30' y='70' font-family='monospace' font-size='40'>L</text>";
+    let wrap = |body: &str| {
+        format!("<svg xmlns='http://www.w3.org/2000/svg' width='160' height='110'>{body}</svg>")
+    };
+    let pixels = painted_pixels(&render_probe(&wrap(label)));
+    let x0 = pixels
+        .iter()
+        .map(|p| p.0)
+        .min()
+        .expect("fixture requires a font rendering L");
+    let x1 = pixels.iter().map(|p| p.0).max().unwrap();
+    let y0 = pixels.iter().map(|p| p.1).min().unwrap();
+    let y1 = pixels.iter().map(|p| p.1).max().unwrap();
+    let dx = (x1 - x0) * 3 / 4;
+    let dy = -(y1 - y0) / 2;
+    assert!(
+        dx > 0 && dx < x1 - x0 && dy < 0 && -dy < y1 - y0,
+        "fixture bounds must intersect"
+    );
+    let shifted = pixels.iter().map(|(x, y)| (x + dx, y + dy)).collect();
+    assert!(
+        pixels.is_disjoint(&shifted),
+        "diagonal L fixture must have disjoint painted pixels"
+    );
+    for (shift, overlap) in [
+        (format!("translate({dx} {dy})"), false),
+        ("translate(0 0)".into(), true),
+    ] {
+        let source = wrap(&format!("{label}<g transform='{shift}'>{label}</g>"));
+        let report = analyze_svg_config(
+            &source,
+            &Config {
+                scale: 1.0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .filter(|w| w.code == "text-overlap")
+                .count(),
+            usize::from(overlap),
+            "{shift}: {report:?}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-not-rendered")
+        );
+        if !overlap {
+            assert!(report.warnings.is_empty(), "{report:?}");
+        }
+    }
+}
+
+#[test]
+fn crossing_ratio_and_padding_control_noncontact_block_intrusion() {
+    let label = "<text x='40' y='60' font-family='sans-serif' font-size='32'>Wide label</text>";
+    let wrap = |body: &str| {
+        format!("<svg xmlns='http://www.w3.org/2000/svg' width='300' height='110'>{body}</svg>")
+    };
+    let pixels = painted_pixels(&render_probe(&wrap(label)));
+    let left = pixels
+        .iter()
+        .map(|p| p.0)
+        .min()
+        .expect("fixture requires rendered text");
+    let right = pixels.iter().map(|p| p.0).max().unwrap();
+    let bottom = pixels.iter().map(|p| p.1).max().unwrap();
+    // This short stroke is below every painted pixel, not a glyph-contact case.
+    let source = wrap(&format!(
+        "{label}<path d='M{} {}H{}' stroke='blue' stroke-width='1'/>",
+        left + (right - left) / 4,
+        bottom as f64 + 2.5,
+        left + (right - left) / 2
+    ));
+    for (ratio, intrusion) in [("0", true), ("1", false)] {
+        let out = cli_svg(
+            &source,
+            &["--json", "--scale", "1", "--crossing-ratio", ratio],
+        );
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "stroke-intrusion"),
+            intrusion,
+            "ratio={ratio}: {report}"
+        );
+    }
+    for (padding, intrusion) in [(0.0, false), (1.0, true)] {
+        let report = analyze_svg_config(
+            &source,
+            &Config {
+                scale: 1.0,
+                crossing_ratio: 0.0,
+                block_padding_fraction: padding,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.warnings.iter().any(|w| w.code == "stroke-intrusion"),
+            intrusion,
+            "padding={padding}: {report:?}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-not-rendered")
+        );
+    }
+}
+
+#[test]
+fn contrast_uses_all_translucent_backing_layers() {
+    // White text against one half-opaque black layer has <4:1 contrast;
+    // two layers composite to about #404040, giving >10:1 for opaque cores.
+    for (layers, low) in [(1, true), (2, false)] {
+        let backing = "<rect width='300' height='100' fill='black' opacity='.5'/>".repeat(layers);
+        let report = analyze_svg(&format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='100'>{backing}<text x='30' y='60' font-family='sans-serif' font-size='32' fill='white'>Label</text></svg>"
+        ));
+        assert_eq!(
+            report.warnings.iter().any(|w| w.code == "low-contrast"),
+            low,
+            "layers={layers}: {report:?}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-not-rendered")
+        );
+    }
+}
+
+#[test]
+fn viewport_edge_warning_distinguishes_cropped_and_interior_text() {
+    for (x, edge) in [(-8, true), (30, false)] {
+        let report = analyze_svg(&format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='100'><text x='{x}' y='60' font-family='monospace' font-size='40'>MMMM</text></svg>"
+        ));
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-at-viewport-edge"),
+            edge,
+            "x={x}: {report:?}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.code == "text-not-rendered")
+        );
+    }
+}
+
+#[test]
+fn help_and_version_have_successful_reports() {
+    for option in ["--help", "-h", "--version", "-V"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+            .arg(option)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.starts_with(&format!("pira_svg_check {}", env!("CARGO_PKG_VERSION"))));
+        if option == "--help" || option == "-h" {
+            for required in [
+                "USAGE",
+                "--json",
+                "--scale",
+                "--min-contrast",
+                "--crossing-ratio",
+                "--font-dir",
+                "--isolated-fonts",
+                "exit code 0",
+                "exit code 2",
+            ] {
+                assert!(text.contains(required), "missing help contract: {required}");
+            }
+        } else {
+            assert_eq!(
+                text,
+                format!("pira_svg_check {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+}
+
+#[test]
+fn usage_errors_are_diagnostics_not_success_reports() {
+    for (args, reason) in [
+        (vec![], "missing SVG input"),
+        (vec!["--unknown"], "unknown option"),
+        (vec!["--font-dir"], "missing value for --font-dir"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr).unwrap().contains(reason));
+    }
+    let out = cli_svg(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>",
+        &[fixture("clear.svg").to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("only one SVG input")
+    );
+}
+
+#[test]
+fn malformed_and_unreadable_inputs_are_analysis_errors_not_clear_reports() {
+    for (source, reason) in [
+        ("not an SVG document", "cannot parse SVG for rendering"),
+        (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect></svg>",
+            "invalid SVG XML",
+        ),
+    ] {
+        for args in [&[][..], &["--json"][..]] {
+            let out = cli_svg(source, args);
+            assert_eq!(out.status.code(), Some(2));
+            assert!(out.stdout.is_empty());
+            assert!(
+                String::from_utf8(out.stderr).unwrap().contains(reason),
+                "{source}"
+            );
+        }
+    }
+    let path = fixture("nonexistent-input.svg");
+    assert!(!path.exists(), "missing-input fixture must not exist");
+    let out = Command::new(env!("CARGO_BIN_EXE_pira_svg_check"))
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("cannot read")
+    );
+}
